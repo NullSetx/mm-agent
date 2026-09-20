@@ -59,6 +59,21 @@ except ImportError:  # pragma: no cover
     ULTRALYTICS_AVAILABLE = False
 
 
+# ---------------------------------------------------------------- 权重目录
+
+#: 模型权重统一放仓库内 weights/（被 .gitignore 覆盖，不会进版本库）。
+#: 与 vision_heavy/models.py 的约定保持一致：换机器时把 weights/ 整个拷过去
+#: 就能离线启动，不用去 ~/.cache 等好几个缓存目录里翻。
+WEIGHTS_DIR_LOCAL = Path(__file__).resolve().parent.parent / "weights"
+
+#: torchvision 预训练权重的缓存位置（ResNet50 走这里）。
+#: 不改的话它会下到 ~/.cache/torch/hub/checkpoints，和别的项目混在一起。
+TORCH_CHECKPOINTS = WEIGHTS_DIR_LOCAL / "checkpoints"
+
+if TORCH_AVAILABLE:
+    torch.hub.set_dir(str(TORCH_CHECKPOINTS))
+
+
 # ---------------------------------------------------------------- 设备与精度
 
 

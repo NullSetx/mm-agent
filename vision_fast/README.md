@@ -29,31 +29,19 @@ NODE_MOCK=1 uvicorn vision_fast.server:app --host 0.0.0.0 --port 8101
 
 绑定 `0.0.0.0` 才能被其他机器的网关访问（文档 §4.1）。
 
-## 自检
+## 自检与冒烟测试
 
 ```bash
-python -m common.selftest     # 契约自检，不需要模型权重，18 项
-curl localhost:8101/health    # 看设备、显存、两个模型的加载状态
-curl localhost:8101/tools     # 看工具清单
+python -m common.selftest              # 契约自检，18 项，不依赖模型权重
+curl localhost:8101/health             # 看设备、显存、两个模型的加载状态
+curl localhost:8101/tools              # 看工具清单
+python vision_fast/smoke_test.py       # 端到端：真实调 detect / classify
+python vision_fast/smoke_test.py <IP>  # 打别的机器
 ```
 
-调一次 `detect`（不用手搓 base64）：
-
-```bash
-python - <<'PY'
-import base64, json, cv2, numpy as np, httpx
-
-img = np.zeros((480, 640, 3), np.uint8)
-img[80:340, 60:330] = (180, 160, 150)
-ok, buf = cv2.imencode(".jpg", img)
-b64 = base64.b64encode(buf.tobytes()).decode()
-
-r = httpx.post("http://127.0.0.1:8101/invoke",
-               json={"tool": "detect", "image": b64, "params": {"conf": 0.25}},
-               timeout=30)
-print(json.dumps(r.json(), ensure_ascii=False, indent=2))
-PY
-```
+冒烟测试会造一张测试图，依次调 `/health`、`/tools`、`detect`、`classify`，
+打印真实推理结果与显存变化，并检查结果里没有 mock 标记。
+脚本在 `.gitignore` 里，是本地自用工具。
 
 ## 权重准备
 
@@ -77,10 +65,11 @@ curl -sSL -O https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo
 
 ### classify 用的 ResNet50
 
-默认用 `torchvision` 的 `ResNet50_Weights.IMAGENET1K_V2`，**首次加载时自动下载**到
-`~/.cache/torch/hub/checkpoints/`（约 98MB），无需手动操作。
+权重与 torchvision 缓存都统一放 **`weights/`**（与 `vision_heavy` 一致，换机器时整个目录拷走即可离线启动）：
 
-要离线部署，就把 `.pth` 放到任意位置并用 `CLS_WEIGHTS` 指过去：
+- 默认用 `torchvision` 的 `ResNet50_Weights.IMAGENET1K_V2`，首次加载自动下载到
+  `weights/checkpoints/`（约 98MB），无需手动操作
+- 要离线部署，就把 `.pth` 放到任意位置并用 `CLS_WEIGHTS` 指过去：
 
 ```bash
 # 在能联网的机器上先导出
@@ -116,6 +105,125 @@ export CLS_WEIGHTS=/path/to/resnet50.pth
 错误会记在 `/health` 的 `detail.models[].error` 里，真正调用该工具时才报明确原因。
 
 想强制卸载排查显存问题，可以调 `models.release_all()`。
+
+## 接口说明
+
+遵循 `docs/分工与接口约定.md` §4.2，对外只有三个端点。**网关（A）对接只需要看这一节。**
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/health` | 存活 + 已注册工具名，网关的 `/api/health` 聚合这个 |
+| GET | `/tools` | 自报工具清单，网关照这个发现工具 |
+| POST | `/invoke` | 统一调用入口 |
+
+### GET /health
+
+```json
+{
+  "node": "vision-fast",
+  "status": "ok",
+  "tools": ["detect", "classify"],
+  "detail": {
+    "device": "cuda",
+    "models": [
+      {"name": "yolov8s", "loaded": true, "load_seconds": 1.8},
+      {"name": "resnet50", "loaded": true, "load_seconds": 0.9}
+    ],
+    "vram": {"available": true, "used_mb": 1450.2, "total_mb": 8188.0},
+    "mock": false
+  }
+}
+```
+
+`detail` 是本节点自加的，**网关不依赖它的内容**，只看 `status` 和 `tools` 即可。
+
+### POST /invoke
+
+请求与响应格式见文档 §4.2，这里给出两个工具的**实际参数和返回字段**。
+
+#### `detect` —— 目标检测
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `conf` | float | `0.25` | 置信度阈值，会被夹到 0~1 |
+| `classes` | list[int] / int / str | `null` | 只检测这些 COCO 类别号；`null` 表示全部 |
+
+```json
+// 请求
+{"tool": "detect", "image": "<base64>", "params": {"conf": 0.25}}
+
+// 成功响应的 result
+{
+  "boxes": [
+    {"xyxy": [48.2, 102.6, 288.4, 305.1], "conf": 0.91, "cls": 0, "label": "person"},
+    {"xyxy": [315.0, 180.2, 470.9, 288.7], "conf": 0.77, "cls": 2, "label": "car"}
+  ],
+  "count": 2,
+  "width": 640, "height": 480,
+  "conf_threshold": 0.25,
+  "elapsed_s": 0.041
+}
+```
+
+- `xyxy` 是**原图像素坐标**（左上角/右下角），前端可直接画框
+- `label` 是 COCO 的 80 类英文名
+- `conf` 传字符串（如 `"0.5"`）会被框架按默认值类型强转成 float
+- 图里没有目标时 `boxes` 为空数组、`count` 为 0，**仍然是 `ok=true`**
+
+#### `classify` —— 整图分类
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `topk` | int | `5` | 返回置信度最高的前 k 个，会被夹到 1~20 |
+
+```json
+// 请求
+{"tool": "classify", "image": "<base64>", "params": {"topk": 3}}
+
+// 成功响应的 result
+{
+  "predictions": [
+    {"index": 285, "label": "Egyptian cat", "score": 0.91},
+    {"index": 281, "label": "tabby, tabby cat", "score": 0.06}
+  ],
+  "top1": {"index": 285, "label": "Egyptian cat", "score": 0.91},
+  "count": 3,
+  "elapsed_s": 0.012
+}
+```
+
+- 标签是 **ImageNet 的 1000 类英文名**（Agent 可直接翻译给用户）
+- `top1` 恒可用，是最可能的那一个
+
+### 错误约定
+
+**工具内部出错时 HTTP 仍是 200**，靠响应体的 `ok=false` 表达（文档 §4.2 明确要求，避免单个工具失败拖垮节点）：
+
+```json
+{"ok": false, "tool": "detect", "result": null,
+ "error": "RuntimeError: 模型 'yolov8s' 不可用（…）。请检查依赖与权重，或置 NODE_MOCK=1 …",
+ "elapsed_ms": 5.5}
+```
+
+只有**未知工具**才返回 HTTP 404，因为那是路由问题而不是执行问题：
+
+```
+POST /invoke {"tool": "不存在的工具"}   →  404
+```
+
+### 给网关的对接信息
+
+节点绑 `0.0.0.0:8101`，局域网可达。按文档 §4.1 用环境变量注入主机名：
+
+```bash
+VISION_FAST_HOST=<节点机器的IP> uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000
+```
+
+联调前先确认节点活着：
+
+```bash
+curl http://<节点IP>:8101/health
+```
 
 ## 接口
 

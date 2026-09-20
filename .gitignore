@@ -16,3 +16,6 @@ venv/
 data/
 weights/
 outputs/
+
+# 本地自用脚本，不进仓库
+/vision_fast/smoke_test.py
