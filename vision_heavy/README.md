@@ -3,6 +3,117 @@
 `ocr` + `stylize` 两个工具。按文档分工跑在 **8GB #2** 节点上。
 两个模型都是**懒加载 + 空闲超时自动释放显存**（见下方「显存行为」）。
 
+## 接口说明
+
+遵循 `docs/分工与接口约定.md` §4.2，对外只有三个端点。**网关（A）对接只需要看这一节。**
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/health` | 存活 + 已注册工具名，网关的 `/api/health` 聚合这个 |
+| GET | `/tools` | 自报工具清单，网关照这个发现工具 |
+| POST | `/invoke` | 统一调用入口 |
+
+### GET /health
+
+```json
+{
+  "node": "vision-heavy",
+  "status": "ok",
+  "tools": ["ocr", "stylize"],
+  "detail": {
+    "device": "cuda",
+    "models": [{"name": "paddleocr-vl", "loaded": true, "load_count": 5, "idle_s": 12.3}],
+    "vram": {"available": true, "used_mb": 3300.8, "total_mb": 15827.3},
+    "mock": false,
+    "styles": ["向日葵", "呐喊", "大碗岛的星期天下午", "星月夜", "神奈川冲浪里"]
+  }
+}
+```
+
+`detail` 是本节点自加的，**网关不依赖它的内容**，只看 `status` 和 `tools` 即可。
+
+### POST /invoke
+
+请求与响应格式见文档 §4.2，这里给出两个工具的**实际参数和返回字段**。
+
+#### `ocr` —— 识别图片中的文字
+
+参数：**无**（`params` 传 `{}` 或省略）。
+
+```json
+// 请求
+{"tool": "ocr", "image": "<base64>", "params": {}}
+
+// 成功响应的 result
+{
+  "texts": [{"text": "第一行"}, {"text": "第二行"}],
+  "full_text": "第一行\n第二行",
+  "count": 2,
+  "raw": "第一行\n第二行"
+}
+```
+
+- `full_text` 是拼好的整段文字，**Agent 直接用这个最省事**
+- `raw` 是模型原始输出，调试用
+- 图里没文字时 `texts` 为空数组、`full_text` 为空串，**仍然是 `ok=true`**
+
+#### `stylize` —— 图像风格迁移
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `style` | str | `""` | **必填**，风格名，取值范围见 `/tools` 的描述或上面的 `detail.styles` |
+| `size` | int | 512 | 输出长边像素，会被夹到 128~1024 |
+| `iters` | int | 100 | 迭代次数，会被夹到 10~400 |
+
+```json
+// 请求
+{"tool": "stylize", "image": "<base64 内容图>",
+ "params": {"style": "星月夜", "size": 512, "iters": 100}}
+
+// 成功响应的 result
+{
+  "image": "<base64 JPEG 结果图>",
+  "style": "星月夜",
+  "size": 512, "iters": 100, "alpha": 1.0, "beta": 1000000.0,
+  "content_loss": 8.69, "style_loss": 8.8e-06,
+  "elapsed_s": 5.1, "width": 512, "height": 341
+}
+```
+
+- **`style` 不传或传了库里没有的名字 → `ok=false`**，`error` 里会列出可用风格
+- 结果图是 **base64 JPEG**，不是文件路径——因为网关和前端在别的机器上，路径不通用
+- 耗时随 `size` 和 `iters` 增长，参考：256px/40 迭代约 1 秒，512px/100 迭代约 5 秒
+
+### 错误约定
+
+**工具内部出错时 HTTP 仍是 200**，靠响应体的 `ok=false` 表达（文档 §4.2 明确要求，避免单个工具失败拖垮节点）：
+
+```json
+{"ok": false, "tool": "stylize", "result": null,
+ "error": "ValueError: 没有名为 '不存在的风格' 的风格。可用风格：向日葵、呐喊、…",
+ "elapsed_ms": 3.2}
+```
+
+只有**未知工具**才返回 HTTP 404，因为那是路由问题而不是执行问题：
+
+```
+POST /invoke {"tool": "不存在的工具"}   →  404
+```
+
+### 给网关的对接信息
+
+节点绑 `0.0.0.0:8102`，局域网可达。按文档 §4.1 用环境变量注入主机名：
+
+```bash
+VISION_HEAVY_HOST=<节点机器的IP> uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000
+```
+
+联调前先确认节点活着：
+
+```bash
+curl http://<节点IP>:8102/health
+```
+
 ## 启动
 
 ```bash
