@@ -22,4 +22,5 @@ outputs/
 
 # 本地 AI 工具的工作目录
 .zcode/
+.zcodeignore
 .workbuddy/
