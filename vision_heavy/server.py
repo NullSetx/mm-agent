@@ -141,8 +141,25 @@ def _run_ocr(bundle: dict, image: np.ndarray) -> dict:
     )
     inputs = processor(text=[prompt], images=[pil], return_tensors="pt").to(device)
 
+    # ⚠️ 这两个参数是实测出来的，不要随便去掉：
+    #
+    # use_cache=True —— 模型自带的 generation_config.json 里写的是
+    #   `"use_cache": false`，会让每生成一个 token 都把整个序列重算一遍，
+    #   复杂度从 O(n) 退化成 O(n²)。实测同一张图：关着 14.7 tok/s（139 秒），
+    #   打开 124 tok/s（16.5 秒），差 8 倍。
+    #
+    # no_repeat_ngram_size —— 这个模型在文字密集的图上会陷入无限重复
+    #   （实测终端截图识别完正文后开始刷 `📝 📝 📝…` 直到撞上 max_new_tokens），
+    #   自己不会输出 EOS。加上 20-gram 去重后，108 个 token 就正常结束，
+    #   0.9 秒出结果，识别内容不受影响。
     with torch.no_grad():
-        generated = model.generate(**inputs, max_new_tokens=2048, do_sample=False)
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=2048,
+            do_sample=False,
+            use_cache=True,
+            no_repeat_ngram_size=20,
+        )
 
     # 去掉 prompt 部分，只保留新生成的 token
     trimmed = generated[:, inputs["input_ids"].shape[1]:]
