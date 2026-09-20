@@ -35,6 +35,21 @@ except ImportError:  # pragma: no cover
     TORCH_AVAILABLE = False
 
 
+# ---------------------------------------------------------------- 权重目录
+
+#: 模型权重统一放这里。虽在仓库内，但被 .gitignore 的 `weights/` 覆盖，不会进版本库。
+#: 放在仓库内而不是散落在 ~/.cache 里的好处：换机器时整个目录拷过去就能离线启动，
+#: 不用再去好几个缓存目录里翻。
+WEIGHTS_DIR = Path(__file__).resolve().parent.parent / "weights"
+
+#: torchvision 的预训练权重缓存位置（VGG19 走这里）。
+#: 不改的话它会下到 ~/.cache/torch/hub/checkpoints，和别的项目混在一起。
+TORCH_CHECKPOINTS = WEIGHTS_DIR / "checkpoints"
+
+if TORCH_AVAILABLE:
+    torch.hub.set_dir(str(WEIGHTS_DIR))
+
+
 # ---------------------------------------------------------------- 设备与精度
 
 
@@ -372,13 +387,10 @@ OCR_MODEL_ID = os.getenv("OCR_MODEL_ID", "PaddlePaddle/PaddleOCR-VL-1.6")
 #: 本地权重目录。设了就优先从这里加载，不发任何网络请求。
 OCR_MODEL_PATH = os.getenv("OCR_MODEL_PATH", "")
 
-#: 默认的本地缓存位置。放在 ~/.cache 而不是仓库里，天然不涉及 gitignore
-_MODEL_CACHE = Path.home() / ".cache" / "mm-agent" / "models"
-
 
 def default_ocr_dir() -> Path:
-    """本地权重默认目录，形如 ~/.cache/mm-agent/models/PaddleOCR-VL-1.6"""
-    return _MODEL_CACHE / OCR_MODEL_ID.split("/")[-1]
+    """本地 OCR 权重默认目录，形如 weights/PaddleOCR-VL-1.6"""
+    return WEIGHTS_DIR / OCR_MODEL_ID.split("/")[-1]
 
 
 def resolve_ocr_source() -> str:
