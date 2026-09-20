@@ -38,10 +38,12 @@ torchvision==0.26.0
 #    CUDA 12.8，flashinfer 的版本检查会直接失败。已在 CUDA 13.0 上实测通过。
 #    （只装 cuda-toolkit-13-0，**不要**装 cuda 元包，那会连带换掉驱动。）
 #
-# vllm==0.26.0
-# langchain
-# langchain-openai
-# openai
+# vllm 只装在能跑 Linux 的环境（16GB 目标机 / WSL2），Windows 侧不装：
+#   pip install vllm==0.26.0
+# 网关侧（Windows）只装下面三个编排依赖，2026-09-20 由 A 启用：
+langchain>=1.0
+langchain-openai>=1.0
+openai
 
 # ── B · vision_fast（8GB #1 节点）─────────────────────────────
 # YOLOv8s + ResNet50，模型常驻显存。torch/torchvision 用上面的公共区。

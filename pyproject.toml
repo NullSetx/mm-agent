@@ -1,0 +1,14 @@
+[project]
+name = "mm-agent"
+version = "0.1.0"
+description = "多模态系统：网关 + 双视觉节点（见 docs/分工与接口约定.md）"
+authors = [
+    { name = "乌云", email = "17369404+wyun2513@user.noreply.gitee.com" }
+]
+requires-python = ">=3.10"
+
+# 纯环境管理：不打包、不声明依赖。
+# 依赖唯一来源是根目录 requirements.txt（三人共享），用 uv 装它：
+#   uv venv && uv pip install -r requirements.txt
+[tool.uv]
+package = false
