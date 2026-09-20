@@ -237,33 +237,38 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
         f"当前可用的工具：\n{tool_list}\n\n"
         "规则：\n"
         "1. 图片已经提供给工具，调用工具时不需要、也无法传图片本身；\n"
-        "2. 只能调用上面列出的工具，禁止调用列表外的工具，更禁止编造检测结果；\n"
-        "3. 工具返回给你的已经是整理好的中文观察文本，**直接依据观察内容回答，"
-        "不要怀疑、不要编造观察里没有的信息**；\n"
-        "4. 用户的问题可能带有错误预设（例如问“有几个人”但图中并没有人）："
-        "一切以观察文本为准，观察里说没有就说没有；\n"
+        "2. 只能调用上面列出的工具，禁止调用列表外的工具，更禁止编造结果；\n"
+        "3. 用户消息里以「[xx 观察]」开头的段落，是系统已经替你调用工具得到的"
+        "**权威结果**，直接依据它回答，不要怀疑、不要编造观察里没有的信息；\n"
+        "4. 用户的问题可能带有错误预设（例如问“有几个人”但观察显示没有人）："
+        "一切以观察为准，观察里说没有就明确说没有；\n"
         "5. 图片类工具（如风格迁移）的生成结果已直接展示给用户，你只需一句话"
         "说明生成了什么，不要试图描述图片文件内容；\n"
-        "6. 如果列表中没有适合当前问题的工具，如实告诉用户该功能暂未接入，"
-        "不要假装完成了检测或识别；\n"
+        "6. 消息里没有对应观察、且列表中没有合适工具时，如实告诉用户该功能"
+        "暂未接入，不要假装完成了检测或识别；\n"
         "7. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
-        "8. 用中文简洁回答；工具失败时如实告诉用户原因。\n\n"
-        "示例——用户附图问「图里有几个人？」，而上面的工具列表里没有物体检测工具：\n"
-        "❌ 错误回答：「图中有两个人。」（编造！图中有没有人你必须借助工具才知道，"
-        "没有工具就不能下结论）\n"
-        "✅ 正确回答：「当前未接入物体检测工具，我无法准确判断图中的人数。」"
+        "8. 用中文简洁回答；工具失败时如实告诉用户原因。"
     )
 
 
-def _human_content(message: str, image: str | None) -> Any:
-    """组 HumanMessage 内容。带图时走多模态 parts，纯文本直接用字符串省 token。"""
-    if not image:
+def _human_content(
+    message: str, image: str | None, observations: str | None = None
+) -> Any:
+    """组 HumanMessage 内容。带图时走多模态 parts，纯文本直接用字符串省 token。
+
+    observations 是网关预取的工具观察（见 gateway._prefetch）：
+    按成员确认的架构，带图请求由网关先确定性调用分析类工具，
+    把润色后的观察文本放进消息，模型依据它回答，不依赖模型自觉调工具。
+    """
+    if not image and not observations:
         return message
-    uri = image if image.startswith("data:") else f"data:image/png;base64,{image}"
-    return [
-        {"type": "text", "text": message},
-        {"type": "image_url", "image_url": {"url": uri}},
-    ]
+    parts = [{"type": "text", "text": message}]
+    if observations:
+        parts[0]["text"] += "\n\n" + observations
+    if image:
+        uri = image if image.startswith("data:") else f"data:image/png;base64,{image}"
+        parts.append({"type": "image_url", "image_url": {"url": uri}})
+    return parts
 
 
 async def run_chat(
@@ -273,8 +278,13 @@ async def run_chat(
     tools: list[StructuredTool],
     chat_model: Any = None,
     max_rounds: int = MAX_TOOL_ROUNDS,
+    observations: str | None = None,
 ) -> tuple[str, list[dict[str, Any]], list[BaseMessage]]:
     """跑一轮对话。
+
+    Args:
+        observations: 网关预取的工具观察文本（带图请求由网关先确定性
+            调用分析类工具生成），会拼进本轮用户消息。
 
     Returns:
         (reply, tool_calls, new_messages)：
@@ -283,7 +293,9 @@ async def run_chat(
     """
     model = chat_model or llm.build_chat_model()
     agent_app = create_agent(model, tools=tools, system_prompt=_system_prompt(tools))
-    human = HumanMessage(content=_human_content(message, image))
+    human = HumanMessage(
+        content=_human_content(message, image, observations)
+    )
 
     token = _current_image.set(image)
     records: list[dict[str, Any]] = []

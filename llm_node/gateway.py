@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -54,6 +55,41 @@ def node_url(node: str) -> str:
     from common.config import HOSTS, PORTS  # 调用时取值，测试改环境变量才生效
 
     return f"http://{HOSTS[node]}:{PORTS[node]}"
+
+
+#: 带图请求网关自动预取的分析类工具（并行调用）。
+#: 生成式工具（stylize）不预取，仍由 LLM 按用户意图自主调用。
+ANALYSIS_TOOLS: tuple[str, ...] = ("detect", "classify", "ocr")
+
+
+async def _prefetch_observations(
+    http: httpx.AsyncClient, catalog: ToolCatalog, image: str
+) -> tuple[str, list[dict[str, Any]]]:
+    """带图请求先确定性调用分析类工具，把润色后的观察文本注入上下文。
+
+    成员确认的架构：图片分析不赌 LLM 自觉调工具——网关直接并行调用
+    当前可用的分析类工具（render_for_llm 润色），模型拿到的就是
+    整理好的观察，照着回答即可。
+    返回 (观察文本, 预取的工具调用记录)。
+    """
+    available = {s.name for s in catalog.specs()}
+    targets = [n for n in ANALYSIS_TOOLS if n in available]
+    if not targets:
+        return "（当前未接入任何图片分析工具，无法分析图片内容。）", []
+
+    async def run(name: str):
+        resp = await invoke_tool(http, catalog, name, image, {})
+        return name, resp
+
+    results = await asyncio.gather(*(run(n) for n in targets))
+    records: list[dict[str, Any]] = []
+    blocks: list[str] = []
+    for name, resp in results:
+        records.append(
+            {"tool": name, "ok": resp.ok, "result": resp.result, "error": resp.error}
+        )
+        blocks.append(f"[{name} 观察] {agent.render_for_llm(name, resp.result, resp.error)}")
+    return "\n".join(blocks), records
 
 
 class GatewayError(RuntimeError):
@@ -335,6 +371,14 @@ def build_app() -> FastAPI:
             reply, records = await agent.mock_chat(req.message, session.image, specs)
             return ChatResponse(reply=reply, tool_calls=records)
 
+        # 带图请求：网关先确定性预取分析类观察（成员确认的架构），
+        # 模型只需依据观察回答；stylize 等生成式工具仍由模型自主调用
+        observations, prefetch_records = None, []
+        if session.image:
+            observations, prefetch_records = await _prefetch_observations(
+                http, catalog, session.image
+            )
+
         def invoke(tool: str, image: str | None, params: dict[str, Any]) -> Any:
             return invoke_tool(http, catalog, tool, image, params)
 
@@ -342,6 +386,7 @@ def build_app() -> FastAPI:
             reply, records, new_msgs = await agent.run_chat(
                 session.history, req.message, session.image,
                 agent.build_tools(specs, invoke),
+                observations=observations,
             )
         except GraphRecursionError:
             return ChatResponse(
@@ -358,7 +403,7 @@ def build_app() -> FastAPI:
             ) from exc
 
         session.history = (session.history + list(new_msgs))[-MAX_HISTORY_MESSAGES:]
-        return ChatResponse(reply=reply, tool_calls=records)
+        return ChatResponse(reply=reply, tool_calls=prefetch_records + records)
 
     return app
 
