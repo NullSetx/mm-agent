@@ -7,8 +7,6 @@ venv/
 .idea/
 .vscode/
 .DS_Store
-
-# WorkBuddy 项目数据（会话记忆、临时脚本等），各人本机生成，不进库
 .workbuddy/
 
 *.pt
