@@ -61,14 +61,14 @@ except ImportError:  # pragma: no cover
 
 # ---------------------------------------------------------------- 权重目录
 
-#: 模型权重统一放仓库内 weights/（被 .gitignore 覆盖，不会进版本库）。
-#: 与 vision_heavy/models.py 的约定保持一致：换机器时把 weights/ 整个拷过去
-#: 就能离线启动，不用去 ~/.cache 等好几个缓存目录里翻。
-WEIGHTS_DIR_LOCAL = Path(__file__).resolve().parent.parent / "weights"
+#: 模型权重统一放仓库内 weights/，路径取自 `common.config.WEIGHTS_DIR`（公共配置，
+#: 被 .gitignore 覆盖，不会进版本库）。与 vision_heavy/models.py 的约定一致：
+#: 换机器时把 weights/ 整个拷过去就能离线启动，不用去 ~/.cache 等好几个缓存目录里翻。
 
 #: torchvision 预训练权重的缓存位置（ResNet50 走这里）。
-#: 不改的话它会下到 ~/.cache/torch/hub/checkpoints，和别的项目混在一起。
-TORCH_CHECKPOINTS = WEIGHTS_DIR_LOCAL / "checkpoints"
+#: 下面这行把 torchvision 的下载缓存从默认的 ~/.cache/torch/hub/checkpoints
+#: 改指到仓库内 weights/checkpoints，保证所有权重集中在一个目录。
+TORCH_CHECKPOINTS = WEIGHTS_DIR / "checkpoints"
 
 if TORCH_AVAILABLE:
     torch.hub.set_dir(str(TORCH_CHECKPOINTS))
@@ -158,7 +158,7 @@ def resolve_resnet_weights() -> str:
 
     `CLS_WEIGHTS` 指向本地文件时手动 load_state_dict（部署机离线场景）；
     不设则用 `ResNet50_Weights.IMAGENET1K_V2`，由 torchvision 自动缓存到
-    `~/.cache/torch/hub/checkpoints/`，同样不涉及仓库。
+    `weights/checkpoints/`（见上方 TORCH_CHECKPOINTS），同样不涉及仓库。
     """
     return os.getenv("CLS_WEIGHTS", "").strip()
 
