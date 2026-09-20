@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mm-agent 测试台</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --line:#e3e6ea; --ink:#1c2330; --sub:#68738a;
+          --me:#2f6fed; --ok:#1a9e55; --bad:#d64545; --warn:#d68f2f; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:var(--ink); height:100vh;
+         display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 18px;
+           background:var(--card); border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  .dots { display:flex; gap:10px; margin-left:auto; font-size:12px; color:var(--sub); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+         background:#c4cad3; margin-right:4px; vertical-align:middle; }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
+  #chat { flex:1; overflow-y:auto; padding:18px; display:flex;
+          flex-direction:column; gap:10px; }
+  .bubble { max-width:72%; padding:9px 13px; border-radius:12px;
+            background:var(--card); border:1px solid var(--line);
+            line-height:1.55; white-space:pre-wrap; word-break:break-word; }
+  .bubble.me { align-self:flex-end; background:var(--me); color:#fff;
+               border-color:var(--me); }
+  .bubble.err { align-self:center; background:#fdecec; border-color:#f2c4c4;
+                color:var(--bad); font-size:13px; }
+  .bubble .tools { margin-top:8px; font-size:12px; }
+  .bubble details { margin-top:6px; }
+  .bubble summary { cursor:pointer; color:var(--sub); }
+  .bubble pre { background:#0f1524; color:#cde3ff; padding:8px 10px;
+                border-radius:8px; overflow:auto; max-height:220px;
+                font-size:11px; margin:6px 0 0; }
+  .hint { align-self:center; color:var(--sub); font-size:12px; }
+  footer { padding:12px 18px; background:var(--card); border-top:1px solid var(--line);
+           display:flex; flex-direction:column; gap:8px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  #session { font-size:12px; color:var(--sub); border:1px solid var(--line);
+             border-radius:6px; padding:4px 8px; width:130px; background:#fafbfc; }
+  button, .btn { border:1px solid var(--line); background:#fafbfc; color:var(--ink);
+                 border-radius:8px; padding:7px 13px; cursor:pointer; font-size:13px; }
+  button:hover { background:#eef1f5; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #send { background:var(--me); color:#fff; border-color:var(--me); min-width:84px; }
+  #send:hover { background:#275fd0; }
+  #text { flex:1; border:1px solid var(--line); border-radius:8px;
+          padding:9px 12px; font-size:14px; outline:none; }
+  #text:focus { border-color:var(--me); }
+  #pick { display:none; }
+  .preview-wrap { display:flex; align-items:center; gap:8px; }
+  #preview { max-height:52px; border-radius:6px; border:1px solid var(--line); }
+  #imgname { font-size:12px; color:var(--sub); }
+</style>
+</head>
+<body>
+<header>
+  <h1>mm-agent 测试台</h1>
+  <div class="dots" id="health">健康检查中…</div>
+</header>
+
+<div id="chat">
+  <div class="hint">选一张图片（可选）→ 输入问题 → 发送。会话由服务端记住，可多轮追问。</div>
+</div>
+
+<footer>
+  <div class="row">
+    <span style="font-size:12px;color:var(--sub)">会话</span>
+    <input id="session" title="会话 ID，可改">
+    <button id="new" title="开一个新会话">新会话</button>
+    <label class="btn" for="pick">📷 上传图片</label>
+    <input type="file" id="pick" accept="image/*">
+    <span class="preview-wrap" id="previewWrap" style="display:none">
+      <img id="preview" alt="预览"><span id="imgname"></span>
+      <button id="clear" title="移除图片">✕</button>
+    </span>
+  </div>
+  <div class="row">
+    <input id="text" placeholder="输入问题，回车发送，例如：图里有什么？">
+    <button id="send">发送</button>
+  </div>
+</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const chat = $("#chat"), text = $("#text"), send = $("#send");
+let imageData = null, pending = false;
+
+$("#session").value = "web-" + crypto.randomUUID().slice(0, 6);
+
+function scrollEnd() { chat.scrollTop = chat.scrollHeight; }
+function bubble(cls, html) {
+  const d = document.createElement("div");
+  d.className = "bubble " + cls; d.innerHTML = html;
+  chat.appendChild(d); scrollEnd(); return d;
+}
+
+// ---- 图片上传：本地转 base64（data URI，服务端契约允许带前缀）----
+$("#pick").addEventListener("change", e => {
+  const f = e.target.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    imageData = r.result;
+    $("#preview").src = imageData;
+    $("#imgname").textContent = f.name + "（" + Math.round(f.size/1024) + " KB）";
+    $("#previewWrap").style.display = "flex";
+  };
+  r.readAsDataURL(f);
+});
+$("#clear").addEventListener("click", () => {
+  imageData = null; $("#pick").value = ""; $("#previewWrap").style.display = "none";
+});
+$("#new").addEventListener("click", () => {
+  $("#session").value = "web-" + crypto.randomUUID().slice(0, 6);
+  bubble("hint", "已开新会话 " + $("#session").value);
+});
+
+// ---- 发送 ----
+async function sendMsg() {
+  const message = text.value.trim();
+  if (!message || pending) return;
+  pending = true; send.disabled = true;
+  bubble("me", message);
+  text.value = "";
+  const body = { session_id: $("#session").value.trim(), message };
+  if (imageData) body.image = imageData;
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      bubble("err", "HTTP " + resp.status + "：" + (data.detail || JSON.stringify(data)));
+    } else {
+      let html = escapeHtml(data.reply || "(空回复)");
+      if (data.tool_calls && data.tool_calls.length) {
+        html += '<div class="tools">' + data.tool_calls.map((t, i) =>
+          '<details><summary>🔧 ' + escapeHtml(t.tool) +
+          (t.ok ? ' ✅' : ' ❌') + '</summary><pre>' +
+          escapeHtml(JSON.stringify(t.ok ? t.result : (t.error || t.result), null, 2)) +
+          '</pre></details>').join("") + '</div>';
+      }
+      bubble("", html);
+    }
+  } catch (e) {
+    bubble("err", "请求失败：" + e.message + "（网关没起？）");
+  } finally {
+    pending = false; send.disabled = false; text.focus();
+  }
+}
+send.addEventListener("click", sendMsg);
+text.addEventListener("keydown", e => { if (e.key === "Enter") sendMsg(); });
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// ---- 健康状态 ----
+async function health() {
+  try {
+    const r = await fetch("/api/health");
+    const h = await r.json();
+    const dot = ok => '<span class="dot ' + (ok ? "ok" : "bad") + '"></span>';
+    $("#health").innerHTML =
+      "网关" + dot(true) +
+      Object.entries(h.nodes).map(([n, v]) => n + dot(v.ok)).join(" ") +
+      " vllm" + dot(h.vllm.ok);
+  } catch {
+    $("#health").innerHTML = "网关" + '<span class="dot bad"></span>';
+  }
+}
+health(); setInterval(health, 15000);
+text.focus();
+</script>
+</body>
+</html>

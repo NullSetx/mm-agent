@@ -50,22 +50,22 @@ _current_image: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _SIMPLE_TYPES: dict[type, type] = {bool: bool, int: int, float: float, str: str}
 
 
-def args_schema(spec: ToolSpec) -> type[BaseModel] | None:
+def args_schema(spec: ToolSpec) -> type[BaseModel]:
     """把 ToolSpec.params（参数名 -> 默认值）转成 Pydantic args schema。
 
     默认值即类型声明（common/registry.py 的同一约定）：默认值为 None 的参数
     （如 detect 的 classes）无法推断类型，按可选 Any 处理。
+    无参数的工具也要给显式空对象 schema——若留空，LangChain 会从 **kwargs
+    签名推断出一个 "kwargs" 属性喂给 LLM，把它带偏。
     """
-    if not spec.params:
-        return None
-    fields: dict[str, tuple[Any, Any]] = {}
-    for name, default in spec.params.items():
-        ann = _SIMPLE_TYPES.get(type(default), Any)
-        fields[name] = (
-            ann,
+    model = create_model(f"{spec.name}_args", **{
+        name: (
+            _SIMPLE_TYPES.get(type(default), Any),
             Field(default=default, description=f"默认 {default!r}"),
         )
-    return create_model(f"{spec.name}_args", **fields)
+        for name, default in spec.params.items()
+    })
+    return model
 
 
 def build_tool(spec: ToolSpec, invoke: InvokeFn) -> StructuredTool:

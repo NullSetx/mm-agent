@@ -42,8 +42,12 @@ def test_args_schema_types_from_defaults():
 
 
 def test_args_schema_empty_params():
+    """无参数工具给显式空 schema，防止 LangChain 推断出误导性的 kwargs 属性。"""
     spec = ToolSpec(name="t", description="d", params={})
-    assert agent.args_schema(spec) is None
+    schema = agent.args_schema(spec)
+    assert schema is not None
+    assert schema.model_fields == {}
+    assert schema.model_json_schema()["properties"] == {}
 
 
 # ---------------------------------------------------------------- 工具兜底

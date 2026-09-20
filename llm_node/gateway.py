@@ -17,10 +17,12 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 from langgraph.errors import GraphRecursionError
 from openai import APIConnectionError, APITimeoutError
 from pydantic import BaseModel, Field
@@ -28,6 +30,9 @@ from pydantic import BaseModel, Field
 from common.config import TOOL_TIMEOUT, mock_enabled
 from common.schemas import InvokeRequest, InvokeResponse, ToolSpec, ToolList
 from llm_node import agent, llm
+
+#: 测试台静态页（浏览器打开 http://<网关>:8000/ 即是）
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 #: 接进网关的视觉节点。新增节点：config.HOSTS/PORTS 加键 + 这里加名字
 VISION_NODES: tuple[str, ...] = ("vision-fast", "vision-heavy")
@@ -235,6 +240,11 @@ def build_app() -> FastAPI:
     app.state.catalog = ToolCatalog()
     app.state.last_refresh: dict[str, Any] = {}
     app.state.sessions = SessionStore()
+
+    @app.get("/", include_in_schema=False)
+    async def index() -> FileResponse:
+        """浏览器测试台：上传图片 + 对话 + 工具调用可视化。"""
+        return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
