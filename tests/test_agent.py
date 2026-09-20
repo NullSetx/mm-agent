@@ -53,14 +53,63 @@ def test_args_schema_empty_params():
 # ---------------------------------------------------------------- 工具兜底
 
 @pytest.mark.anyio
-async def test_tool_payload_reports_failure_not_raise():
+async def test_tool_observation_reports_failure_not_raise():
     async def invoke(tool, image, params):
         raise gw.GatewayError(502, "节点不可达")
 
     tool = agent.build_tool(ToolSpec(name="x", description="d", needs_image=False), invoke)
-    payload = json.loads(await tool.ainvoke({}))
-    assert payload["ok"] is False
-    assert "GatewayError" in payload["error"]
+    out = await tool.ainvoke({})
+    assert out.startswith("工具执行失败")
+    assert "GatewayError" in out
+
+
+# ---------------------------------------------------------------- 结果加工层
+
+def test_render_detect_lists_objects():
+    r = {"boxes": [
+            {"xyxy": [64.0, 38.4, 332.8, 345.6], "conf": 0.91, "cls": 0, "label": "person"},
+            {"xyxy": [371.2, 168.0, 608.0, 326.4], "conf": 0.77, "cls": 2, "label": "car"},
+         ], "count": 2, "width": 640, "height": 480}
+    text = agent.render_for_llm("detect", r, None)
+    assert "共检测到 2 个物体" in text
+    assert "person（置信度 0.91）位于 [64, 38, 333, 346]" in text
+    assert "car（置信度 0.77）" in text
+
+
+def test_render_detect_empty():
+    text = agent.render_for_llm("detect", {"boxes": [], "count": 0}, None)
+    assert "没有检测到" in text
+
+
+def test_render_ocr_lines():
+    r = {"texts": [{"text": "第一行"}, {"text": "第二行"}],
+         "full_text": "第一行\n第二行", "count": 2,
+         "raw": "第一行\n第二行"}
+    text = agent.render_for_llm("ocr", r, None)
+    assert "识别出 2 行文字" in text
+    assert "1. 第一行" in text and "2. 第二行" in text
+    assert "raw" not in text  # 冗余的原始副本不进观察
+
+
+def test_render_stylize_hides_base64():
+    r = {"image": "A" * 5000, "style": "星月夜", "width": 256, "height": 96}
+    text = agent.render_for_llm("stylize", r, None)
+    assert "星月夜" in text and "256×96" in text and "展示给用户" in text
+    assert "AAAA" not in text  # base64 不进观察
+
+
+def test_render_failure():
+    text = agent.render_for_llm("any", None, "RuntimeError: 炸了")
+    assert text == "工具执行失败：RuntimeError: 炸了"
+
+
+def test_render_fallback_strips_raw_and_big_fields():
+    """未来新工具没注册渲染器：兜底 JSON 剔 raw、大字段占位。"""
+    r = {"raw": "x" * 5000, "items": [{"image": "B" * 5000}], "n": 1}
+    text = agent.render_for_llm("future_tool", r, None)
+    assert "raw" not in text
+    assert "x" * 100 not in text and "B" * 100 not in text
+    assert '"n": 1' in text
 
 
 # ---------------------------------------------------------------- mock 对话

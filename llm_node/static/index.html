@@ -136,19 +136,22 @@ async function sendMsg() {
     } else {
       let html = escapeHtml(data.reply || "(空回复)");
       if (data.tool_calls && data.tool_calls.length) {
-        html += '<div class="tools">' + data.tool_calls.map((t, i) => {
+        const imgs = [];
+        const details = data.tool_calls.map(t => {
           const r = t.ok ? t.result : (t.error || t.result);
-          let body = escapeHtml(JSON.stringify(r, null, 2));
-          let isImg = false;
+          let shown = r;
           if (r && typeof r === "object" && typeof r.image === "string" && r.image.length > 100) {
-            const src = r.image.startsWith("data:") ? r.image : "data:image/png;base64," + r.image;
-            body = '<img src="' + src + '" style="max-width:100%;border-radius:6px">';
-            isImg = true;
+            imgs.push(r.image.startsWith("data:") ? r.image : "data:image/png;base64," + r.image);
+            shown = { ...r, image: "（图片已内联展示）" };
           }
           return '<details><summary>🔧 ' + escapeHtml(t.tool) +
-            (t.ok ? ' ✅' : ' ❌') + '</summary>' +
-            (isImg ? body : '<pre>' + body + '</pre>') + '</details>';
-        }).join("") + '</div>';
+            (t.ok ? ' ✅' : ' ❌') + '</summary><pre>' +
+            escapeHtml(JSON.stringify(shown, null, 2)) + '</pre></details>';
+        }).join("");
+        html += imgs.map(src =>
+          '<div style="margin-top:8px"><img src="' + src +
+          '" style="max-width:100%;border-radius:8px"></div>').join("") +
+          '<div class="tools">' + details + '</div>';
       }
       bubble("", html);
     }

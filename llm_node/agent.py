@@ -24,7 +24,6 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
-    ToolMessage,
 )
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
@@ -43,6 +42,112 @@ InvokeFn = Callable[[str, str | None, dict[str, Any]], Awaitable[Any]]
 _current_image: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "current_image", default=None
 )
+
+#: 本轮对话的完整工具调用记录（给前端）。工具执行时追加。
+#: 与 _current_image 同理：工具实例共享，记录是每次请求的
+_current_records: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "current_records", default=None
+)
+
+#: 结果里超过这个长度的字符串字段（base64 图片等）不喂给 LLM，
+#: 替换成占位符；完整数据仍走 /api/chat 响应给前端
+_LLM_FIELD_LIMIT = 4096
+
+
+def _slim_for_llm(value: Any) -> Any:
+    """递归地整理任意工具结果，供"未知工具"的兜底渲染使用：
+    - 剔除 `raw` 字段：各工具约定 raw 是后端原始输出副本（如 ocr 的 raw 与
+      full_text 逐字重复），喂给 LLM 是纯冗余；
+    - 超长字符串（base64 图片等，> _LLM_FIELD_LIMIT）替换为占位符。
+    前端拿到的仍是完整数据，裁剪只发生在"给 LLM 的观察文本"这一层。
+    """
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k == "raw":
+                continue
+            if isinstance(v, str) and len(v) > _LLM_FIELD_LIMIT:
+                out[k] = f"<大字段已省略（{len(v)} 字符），已在用户界面展示>"
+            else:
+                out[k] = _slim_for_llm(v)
+        return out
+    if isinstance(value, list):
+        return [_slim_for_llm(v) for v in value]
+    return value
+
+
+# ---------------------------------------------------------------- 结果加工层
+
+def _render_detect(r: dict[str, Any]) -> str:
+    boxes = r.get("boxes") or []
+    if not boxes:
+        return "检测完成：图中没有检测到目标物体。"
+    lines = []
+    for b in boxes:
+        xyxy = b.get("xyxy") or []
+        pos = f"位于 [{', '.join(str(round(c)) for c in xyxy)}]" if len(xyxy) == 4 else ""
+        lines.append(f"- {b.get('label', '?')}（置信度 {b.get('conf')}）{pos}")
+    size = ""
+    if r.get("width") and r.get("height"):
+        size = f"图片尺寸 {r['width']}×{r['height']}。"
+    return f"共检测到 {len(boxes)} 个物体。{size}\n" + "\n".join(lines)
+
+
+def _render_ocr(r: dict[str, Any]) -> str:
+    lines = [t.get("text", "") for t in (r.get("texts") or []) if isinstance(t, dict)]
+    lines = [ln for ln in lines if ln]
+    if lines:
+        numbered = "\n".join(f"{i}. {ln}" for i, ln in enumerate(lines, 1))
+        return f"识别出 {len(lines)} 行文字：\n{numbered}"
+    full = (r.get("full_text") or "").strip()
+    return f"识别结果：{full}" if full else "识别完成：图中没有文字。"
+
+
+def _render_classify(r: dict[str, Any]) -> str:
+    preds = r.get("predictions") or []
+    parts = [
+        f"{p.get('label')}（{p.get('score')}）"
+        for p in preds[: int(r.get("topk") or len(preds)) or len(preds)]
+        if isinstance(p, dict)
+    ]
+    return "整图分类候选：" + "、".join(parts) if parts else "分类完成，无候选结果。"
+
+
+def _render_stylize(r: dict[str, Any]) -> str:
+    style = r.get("style") or "指定"
+    size = ""
+    if r.get("width") and r.get("height"):
+        size = f"（{r['width']}×{r['height']}）"
+    return f"已生成「{style}」风格图片{size}，图片已直接展示给用户。"
+
+
+#: 已知工具的观察渲染器。未来新增工具若没注册渲染器，走 _render_fallback
+_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
+    "detect": _render_detect,
+    "classify": _render_classify,
+    "ocr": _render_ocr,
+    "stylize": _render_stylize,
+}
+
+
+def render_for_llm(tool_name: str, result: Any, error: str | None = None) -> str:
+    """工具结果加工层：把工具返回的 JSON 润色成给 LLM 的中文观察文本。
+
+    小模型读嵌套 JSON 既费 token 又容易编造；润色后的观察文本让它
+    "照着念"就能得到正确回答。渲染器缺失或渲染出错时兜底为精简 JSON
+    （剔 raw、大字段占位）。
+    """
+    if error:
+        return f"工具执行失败：{error}"
+    if result is None:
+        return "工具执行完成，没有返回数据。"
+    renderer = _RENDERERS.get(tool_name)
+    if renderer is not None and isinstance(result, dict):
+        try:
+            return renderer(result)
+        except Exception:  # noqa: BLE001 - 渲染失败不能断对话，兜底精简 JSON
+            pass
+    return json.dumps(_slim_for_llm(result), ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- 工具构建
@@ -79,20 +184,27 @@ def build_tool(spec: ToolSpec, invoke: InvokeFn) -> StructuredTool:
         image = _current_image.get() if spec.needs_image else None
         try:
             resp = await invoke(spec.name, image, kwargs)
-            payload = {
-                "tool": spec.name,
-                "ok": resp.ok,
-                "result": resp.result,
-                "error": resp.error,
-            }
         except Exception as exc:  # noqa: BLE001 - 工具失败要反馈给 LLM 而不是炸掉对话
-            payload = {
-                "tool": spec.name,
-                "ok": False,
-                "result": None,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        return json.dumps(payload, ensure_ascii=False)
+            err = f"{type(exc).__name__}: {exc}"
+            records = _current_records.get()
+            if records is not None:
+                records.append(
+                    {"tool": spec.name, "ok": False, "result": None, "error": err}
+                )
+            return f"工具执行失败：{err}"
+
+        records = _current_records.get()
+        if records is not None:
+            records.append(
+                {
+                    "tool": spec.name,
+                    "ok": resp.ok,
+                    "result": resp.result,  # 完整数据给前端
+                    "error": resp.error,
+                }
+            )
+        # 给 LLM 的是润色后的中文观察（render_for_llm 内部剔 raw、大字段占位）
+        return "工具结果：" + render_for_llm(spec.name, resp.result, resp.error)
 
     return StructuredTool.from_function(
         coroutine=_run,
@@ -126,14 +238,20 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
         "规则：\n"
         "1. 图片已经提供给工具，调用工具时不需要、也无法传图片本身；\n"
         "2. 只能调用上面列出的工具，禁止调用列表外的工具，更禁止编造检测结果；\n"
-        "3. 涉及图片内容的问题（物体、位置、数量、文字、类别等）必须先调用"
-        "列表中对应的工具，并且**只依据工具返回的结果回答**；\n"
+        "3. 工具返回给你的已经是整理好的中文观察文本，**直接依据观察内容回答，"
+        "不要怀疑、不要编造观察里没有的信息**；\n"
         "4. 用户的问题可能带有错误预设（例如问“有几个人”但图中并没有人）："
-        "一切以工具结果为准，工具查不到就明确说图中没有；\n"
-        "5. 如果列表中没有适合当前问题的工具，如实告诉用户该功能暂未接入，"
+        "一切以观察文本为准，观察里说没有就说没有；\n"
+        "5. 图片类工具（如风格迁移）的生成结果已直接展示给用户，你只需一句话"
+        "说明生成了什么，不要试图描述图片文件内容；\n"
+        "6. 如果列表中没有适合当前问题的工具，如实告诉用户该功能暂未接入，"
         "不要假装完成了检测或识别；\n"
-        "6. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
-        "7. 用中文简洁回答；工具失败时如实告诉用户原因。"
+        "7. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
+        "8. 用中文简洁回答；工具失败时如实告诉用户原因。\n\n"
+        "示例——用户附图问「图里有几个人？」，而上面的工具列表里没有物体检测工具：\n"
+        "❌ 错误回答：「图中有两个人。」（编造！图中有没有人你必须借助工具才知道，"
+        "没有工具就不能下结论）\n"
+        "✅ 正确回答：「当前未接入物体检测工具，我无法准确判断图中的人数。」"
     )
 
 
@@ -168,6 +286,8 @@ async def run_chat(
     human = HumanMessage(content=_human_content(message, image))
 
     token = _current_image.set(image)
+    records: list[dict[str, Any]] = []
+    token_r = _current_records.set(records)
     try:
         result = await agent_app.ainvoke(
             {"messages": [*history, human]},
@@ -175,6 +295,7 @@ async def run_chat(
         )
     finally:
         _current_image.reset(token)
+        _current_records.reset(token_r)
 
     all_msgs: list[BaseMessage] = result["messages"]
     new_msgs = all_msgs[len(history) + 1:]  # 截掉输入部分，只留本轮新增
@@ -185,20 +306,9 @@ async def run_chat(
             reply = msg.content if isinstance(msg.content, str) else str(msg.content)
             break
 
-    tool_calls: list[dict[str, Any]] = []
-    for msg in new_msgs:
-        if not isinstance(msg, ToolMessage):
-            continue
-        record: dict[str, Any] = {"tool": msg.name}
-        try:
-            payload = json.loads(msg.content)
-            record["ok"] = bool(payload.get("ok"))
-            record["result"] = payload.get("result")
-            if payload.get("error"):
-                record["error"] = payload["error"]
-        except (TypeError, ValueError):
-            record.update(ok=False, result=str(msg.content))
-        tool_calls.append(record)
+    # 完整记录（含 base64 图片）由工具执行时经 ContextVar 汇总，供前端渲染；
+    # ToolMessage 里的内容是裁剪后的 LLM 视图，不再用于组装响应
+    tool_calls = list(records)
 
     return reply, tool_calls, new_msgs
 
