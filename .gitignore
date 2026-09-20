@@ -16,6 +16,7 @@ weights/
 outputs/
 
 # 各人本地自用的开发/测试脚本与产物，不进仓库
+/vision_fast/smoke_test.py
 /vision_heavy/smoke_test.py
 /vision_heavy/ocr_cli.py
 /test/
