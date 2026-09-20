@@ -1,0 +1,40 @@
+# 多模态系统依赖
+#
+# 文档 §8：每台机器在仓库根目录 `pip install -r requirements.txt`。
+# 公共依赖默认启用；各节点的额外依赖以注释分区列出，**由各人按需自行启用**，
+# 避免 B/C 的机器被迫装上 vllm 这种巨物。
+#
+# 版本按 2026-09 的实测环境锁定。
+
+# ── 公共（common/，三人都需要）────────────────────────────────
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+numpy==2.2.6
+opencv-python-headless==5.0.0.93
+pillow==12.3.0
+httpx==0.28.1          # common/selftest.py 的 TestClient 需要
+
+# ── A · llm_node（16GB 节点）──────────────────────────────────
+# 网关 + LangChain Agent + vLLM。在 16GB 机器上启用。
+# vllm==0.29.0
+# langchain
+# langchain-openai
+# openai
+# requests
+
+# ── B · vision_fast（8GB #1 节点）─────────────────────────────
+# YOLOv8s + ResNet50，模型常驻显存。在 8GB 机器上启用。
+# torch
+# torchvision
+# ultralytics
+
+# ── C · vision_heavy（8GB #2 节点）────────────────────────────
+# ocr + stylize，懒加载。在 8GB 机器上启用。
+torch==2.11.0
+torchvision==0.26.0
+# OCR 模型走 transformers 加载 PaddleOCR-VL（0.9B）。
+# 装完还需要把权重放到本机（约 1.8GB，见 README），或用 OCR_MODEL_ID 指定别的权重。
+transformers
+# 若不使用 PaddleOCR-VL，可改用 PP-OCRv6（34.5M，纯 CPU 可跑，几乎不占显存）：
+# rapidocr-onnxruntime
