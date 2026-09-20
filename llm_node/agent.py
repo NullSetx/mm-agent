@@ -108,16 +108,33 @@ def build_tools(specs: list[ToolSpec], invoke: InvokeFn) -> list[StructuredTool]
 
 # ---------------------------------------------------------------- 对话循环
 
-SYSTEM_PROMPT = (
-    "你是多模态视觉助手，用户可能附带图片，需要你借助视觉工具回答。\n"
-    "规则：\n"
-    "1. 图片已经提供给工具，调用工具时不需要、也无法传图片本身；\n"
-    "2. **凡涉及图片内容的问题（有什么物体、位置、数量、文字、类别等），"
-    "必须先调用对应工具拿到结果，再根据结果回答；禁止不调工具直接描述图片**："
-    "看物体用 detect，判断整图类别用 classify，读文字用 ocr，改画风用 stylize；\n"
-    "3. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
-    "4. 用中文简洁回答；工具失败时如实告诉用户原因。"
-)
+def _system_prompt(tools: list[StructuredTool]) -> str:
+    """按实际可用的工具动态生成系统提示。
+
+    写死工具名会在节点上下线后失真：比如 detect 下线后模型仍被要求
+    "看物体用 detect"，调不到就编造检测结果。动态列出真实工具，并明确
+    禁止编造，模型缺工具时才会如实说"该功能暂未接入"。
+    """
+    lines = []
+    for t in tools:
+        first = (t.description or "").split("。")[0]
+        lines.append(f"- {t.name}: {first}。")
+    tool_list = "\n".join(lines) if lines else "（当前没有可用工具）"
+    return (
+        "你是多模态视觉助手，用户可能附带图片，需要你借助视觉工具回答。\n"
+        f"当前可用的工具：\n{tool_list}\n\n"
+        "规则：\n"
+        "1. 图片已经提供给工具，调用工具时不需要、也无法传图片本身；\n"
+        "2. 只能调用上面列出的工具，禁止调用列表外的工具，更禁止编造检测结果；\n"
+        "3. 涉及图片内容的问题（物体、位置、数量、文字、类别等）必须先调用"
+        "列表中对应的工具，并且**只依据工具返回的结果回答**；\n"
+        "4. 用户的问题可能带有错误预设（例如问“有几个人”但图中并没有人）："
+        "一切以工具结果为准，工具查不到就明确说图中没有；\n"
+        "5. 如果列表中没有适合当前问题的工具，如实告诉用户该功能暂未接入，"
+        "不要假装完成了检测或识别；\n"
+        "6. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
+        "7. 用中文简洁回答；工具失败时如实告诉用户原因。"
+    )
 
 
 def _human_content(message: str, image: str | None) -> Any:
@@ -147,12 +164,12 @@ async def run_chat(
         （文档 §4.3 响应形状）；new_messages 供调用方回填会话历史。
     """
     model = chat_model or llm.build_chat_model()
-    agent = create_agent(model, tools=tools, system_prompt=SYSTEM_PROMPT)
+    agent_app = create_agent(model, tools=tools, system_prompt=_system_prompt(tools))
     human = HumanMessage(content=_human_content(message, image))
 
     token = _current_image.set(image)
     try:
-        result = await agent.ainvoke(
+        result = await agent_app.ainvoke(
             {"messages": [*history, human]},
             config={"recursion_limit": max_rounds * 2 + 8},
         )
