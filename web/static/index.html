@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mm-agent 多模态智能体演示</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<h2 class="sr-only">mm-agent 多模态智能体演示页：查看各节点状态、进行图文对话、直接调用视觉工具并可视化结果。</h2>
+
+<header class="top">
+  <div class="brand">
+    <h1>mm-agent 多模态智能体演示</h1>
+    <p class="sub">校园网内浏览器访问 · 页面只调网关 <code>/api/*</code>，模型调用全部走 HTTP 端口</p>
+  </div>
+  <div class="gw">
+    <label for="gwTarget">网关地址</label>
+    <input id="gwTarget" type="text" spellcheck="false" placeholder="http://192.168.1.20:8000">
+    <button id="gwApply" class="btn primary" type="button">应用</button>
+    <span id="gwState" class="pill idle">未连接</span>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section class="card">
+    <h2>节点状态
+      <span class="actions">
+        <button id="btnHealth" class="btn" type="button">刷新状态</button>
+        <button id="btnRefreshTools" class="btn" type="button">重新发现工具</button>
+      </span>
+    </h2>
+    <div class="grid" id="statusGrid"></div>
+    <p class="hint" id="statusHint">联调顺序：先看这里是否全绿，再做对话与工具调用。</p>
+  </section>
+
+  <section class="card">
+    <h2>当前图片 <span class="hint-inline">对话与工具直调共用这张图</span></h2>
+    <div class="row">
+      <input type="file" id="fileInput" accept="image/*">
+      <button id="btnSample" class="btn" type="button">生成示例图</button>
+      <button id="btnClearImg" class="btn" type="button">清除</button>
+      <span class="hint" id="imgInfo">未选择</span>
+    </div>
+    <div class="preview">
+      <img id="imgPreview" alt="当前图片预览">
+      <canvas id="overlay"></canvas>
+      <span class="placeholder" id="imgPlaceholder">选择或拍一张图片，然后提问 / 调用工具</span>
+    </div>
+  </section>
+
+  <div class="cols">
+    <section class="card">
+      <h2>图文对话
+        <span class="actions">
+          <button id="btnClearChat" class="btn" type="button">清空会话</button>
+        </span>
+      </h2>
+      <div class="chat" id="chatLog"></div>
+      <div class="row">
+        <textarea id="chatInput" rows="2" placeholder="例如：图里有什么？最左边那个人在哪？"></textarea>
+        <button id="btnSend" class="btn primary" type="button">发送</button>
+      </div>
+      <p class="hint">同一会话可连续提问（网关按 session_id 记历史）；回复下方列出这次实际发生的工具调用。</p>
+    </section>
+
+    <section class="card">
+      <h2>工具直调</h2>
+      <div class="row">
+        <label for="toolSelect">工具</label>
+        <select id="toolSelect"></select>
+        <button id="btnInvoke" class="btn primary" type="button">调用</button>
+      </div>
+      <div class="params" id="paramForm"></div>
+      <div class="row">
+        <button id="btnSelfCheck" class="btn" type="button">一键自检 detect + classify</button>
+      </div>
+      <div class="result" id="toolResult"></div>
+    </section>
+  </div>
+
+  <p class="footer">演示前端（B 交付）· 静态页与 <code>/api/*</code> 同源代理，端口 8103 · 全部结果来自网关转发到各节点的真实调用</p>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
