@@ -25,3 +25,6 @@ outputs/
 .zcode/
 .zcodeignore
 .workbuddy/
+
+# uv 在无包项目下的锁文件（依赖唯一来源是 requirements.txt）
+uv.lock
