@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import pytest
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
 
-from llm_node import gateway as gw
+from llm_node import gateway as gw, llm
 from tests.conftest import TimeoutTransport, fake_vllm_transport, make_toy_node
 
 FAST = gw.node_url("vision-fast")
 HEAVY = gw.node_url("vision-heavy")
+
+
+class FakeAgentModel(FakeMessagesListChatModel):
+    """回答一次就结束的假 LLM；bind_tools 返回自身以兼容 create_agent。"""
+
+    def bind_tools(self, tools, **kwargs):  # noqa: ANN001, ANN003
+        return self
 
 
 def echo_tools() -> list[dict]:
@@ -156,3 +165,45 @@ async def test_stale_catalog_returns_404_with_refresh_hint(gateway, router):
     resp = await gateway.post("/api/invoke", json={"tool": "echo"})
     assert resp.status_code == 404
     assert "refresh" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------- OCR 意图门控
+
+def test_ocr_intent_positive():
+    for msg in ("图里写了什么？", "帮我读一下文字", "验证码是多少", "那个牌子的号码"):
+        assert gw._has_ocr_intent(msg), msg
+
+
+def test_ocr_intent_negative():
+    for msg in ("图里有什么物体？", "图里有几个人？", "这是什么品种的猫？"):
+        assert not gw._has_ocr_intent(msg), msg
+
+
+@pytest.mark.anyio
+async def test_prefetch_skips_ocr_without_intent(gateway, router, monkeypatch):
+    """问题没有文字类意图时，预取不应包含 ocr；带意图时才预取。"""
+    router[FAST] = make_toy_node("vision-fast", echo_tools())
+    router[HEAVY] = make_toy_node("vision-heavy", [
+        {"name": "ocr", "description": "识别文字", "needs_image": True,
+         "params": {}, "fn": lambda image: {"full_text": ""}},
+    ])
+    await gateway.post("/api/tools/refresh")
+    monkeypatch.setattr(
+        llm, "build_chat_model",
+        lambda **kw: FakeAgentModel(responses=[AIMessage(content="好")]),
+    )
+
+    resp = await gateway.post(
+        "/api/chat",
+        json={"session_id": "s1", "message": "图里有什么物体？", "image": "aGk="},
+    )
+    prefetched = [t["tool"] for t in resp.json()["tool_calls"]]
+    assert "ocr" not in prefetched
+    assert "echo" not in prefetched  # 非分析类工具不进预取名单
+
+    resp = await gateway.post(
+        "/api/chat",
+        json={"session_id": "s1", "message": "图里写了什么？", "image": "aGk="},
+    )
+    prefetched = [t["tool"] for t in resp.json()["tool_calls"]]
+    assert "ocr" in prefetched

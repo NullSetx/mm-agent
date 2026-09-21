@@ -15,22 +15,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
+from langchain_core.messages import HumanMessage
 from langgraph.errors import GraphRecursionError
 from openai import APIConnectionError, APITimeoutError
 from pydantic import BaseModel, Field
 
-from common.config import TOOL_TIMEOUT, mock_enabled
+from common.config import DATA_DIR, TOOL_TIMEOUT, mock_enabled
 from common.schemas import InvokeRequest, InvokeResponse, ToolSpec, ToolList
 from llm_node import agent, llm
+from llm_node.sessions import SessionStore
 
 #: 测试台静态页（浏览器打开 http://<网关>:8000/ 即是）
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -61,19 +63,38 @@ def node_url(node: str) -> str:
 #: 生成式工具（stylize）不预取，仍由 LLM 按用户意图自主调用。
 ANALYSIS_TOOLS: tuple[str, ...] = ("detect", "classify", "ocr")
 
+#: 触发 ocr 预取的文字类意图词。ocr 是预取里最慢的一环（生成式识别 1~2.5s），
+#: 图里明显没文字时调它纯属浪费，所以只有问题本身有读字诉求才带上它。
+#: 启发式必有漏网（如"这是什么牌子"），换来的是多数无文字图片明显提速。
+_OCR_INTENT_PATTERN = re.compile(
+    r"文字|写了|写着|读到|读出|说什么|说的什么|标题|验证码|号码|字母|数字|识别(文字|一下|下)"
+)
+
+
+def _has_ocr_intent(message: str) -> bool:
+    return bool(_OCR_INTENT_PATTERN.search(message or ""))
+
 
 async def _prefetch_observations(
-    http: httpx.AsyncClient, catalog: ToolCatalog, image: str
+    http: httpx.AsyncClient,
+    catalog: ToolCatalog,
+    image: str,
+    message: str = "",
 ) -> tuple[str, list[dict[str, Any]]]:
     """带图请求先确定性调用分析类工具，把润色后的观察文本注入上下文。
 
     成员确认的架构：图片分析不赌 LLM 自觉调工具——网关直接并行调用
     当前可用的分析类工具（render_for_llm 润色），模型拿到的就是
     整理好的观察，照着回答即可。
+    ocr 只在问题带文字类意图时预取（见 _has_ocr_intent）。
     返回 (观察文本, 预取的工具调用记录)。
     """
     available = {s.name for s in catalog.specs()}
-    targets = [n for n in ANALYSIS_TOOLS if n in available]
+    # ocr 是预取里最慢的一环，只有问题带文字类意图才预取
+    targets = [
+        n for n in ANALYSIS_TOOLS
+        if n in available and (n != "ocr" or _has_ocr_intent(message))
+    ]
     if not targets:
         return "（当前未接入任何图片分析工具，无法分析图片内容。）", []
 
@@ -222,24 +243,7 @@ async def invoke_tool(
 
 
 # ---------------------------------------------------------------- 会话
-
-@dataclass
-class Session:
-    """一个会话 = 消息历史 + 当前图片（每次传图覆盖，最近一张为准）。"""
-
-    history: list[Any] = field(default_factory=list)
-    image: str | None = None
-
-
-class SessionStore:
-    """内存会话表。进程重启即失效——文档未要求持久化，先不做。"""
-
-    def __init__(self) -> None:
-        self._sessions: dict[str, Session] = {}
-
-    def get(self, session_id: str) -> Session:
-        return self._sessions.setdefault(session_id, Session())
-
+# Session / SessionStore 见 llm_node/sessions.py（SQLite 持久化）。
 
 # ---------------------------------------------------------------- 请求/响应模型
 
@@ -275,7 +279,7 @@ def build_app() -> FastAPI:
     app = FastAPI(title="mm-agent gateway", version="1.0", lifespan=lifespan)
     app.state.catalog = ToolCatalog()
     app.state.last_refresh: dict[str, Any] = {}
-    app.state.sessions = SessionStore()
+    app.state.sessions = SessionStore(DATA_DIR / "sessions.db")
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -369,6 +373,7 @@ def build_app() -> FastAPI:
 
         if mock_enabled():
             reply, records = await agent.mock_chat(req.message, session.image, specs)
+            request.app.state.sessions.save(req.session_id, session)
             return ChatResponse(reply=reply, tool_calls=records)
 
         # 带图请求：网关先确定性预取分析类观察（成员确认的架构），
@@ -376,7 +381,7 @@ def build_app() -> FastAPI:
         observations, prefetch_records = None, []
         if session.image:
             observations, prefetch_records = await _prefetch_observations(
-                http, catalog, session.image
+                http, catalog, session.image, req.message
             )
 
         def invoke(tool: str, image: str | None, params: dict[str, Any]) -> Any:
@@ -402,7 +407,16 @@ def build_app() -> FastAPI:
                 detail=f"LLM 服务不可达（{llm.vllm_base_url()}），请先启动 vLLM：{exc}",
             ) from exc
 
-        session.history = (session.history + list(new_msgs))[-MAX_HISTORY_MESSAGES:]
+        # 历史拼装：用户消息也进历史（P0，只存文本），并按调用对对齐裁剪（P1）
+        session.history = agent.trim_history(
+            [
+                *session.history,
+                HumanMessage(content=req.message),
+                *new_msgs,
+            ],
+            MAX_HISTORY_MESSAGES,
+        )
+        request.app.state.sessions.save(req.session_id, session)
         return ChatResponse(reply=reply, tool_calls=prefetch_records + records)
 
     return app

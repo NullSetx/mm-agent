@@ -15,6 +15,7 @@ import pytest
 from common.node import build_app
 from common.registry import ToolRegistry
 from llm_node import gateway as gw
+from llm_node.sessions import SessionStore
 
 
 class OriginRouter(httpx.AsyncBaseTransport):
@@ -82,10 +83,14 @@ def router() -> dict[str, httpx.AsyncBaseTransport]:
 
 
 @pytest.fixture
-def gateway(router: dict[str, httpx.AsyncBaseTransport], monkeypatch) -> httpx.AsyncClient:
-    """带路由传输层的网关客户端。lifespan 不跑，http 客户端由这里注入。"""
+def gateway(router: dict[str, httpx.AsyncBaseTransport], monkeypatch, tmp_path):
+    """带路由传输层的网关客户端。lifespan 不跑，http 客户端与会话存储由这里注入。
+
+    会话存储用 tmp 下的真实 SQLite（隔离 + 走真实存储路径）。
+    """
     monkeypatch.delenv("NODE_MOCK", raising=False)
     app = gw.build_app()
+    app.state.sessions = SessionStore(tmp_path / "test_sessions.db")
     app.state.http = httpx.AsyncClient(transport=OriginRouter(router))
     router["_app"] = app  # 供测试检查 catalog / session 状态
     return httpx.AsyncClient(

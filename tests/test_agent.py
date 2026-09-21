@@ -12,6 +12,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage
 
 from common.schemas import InvokeResponse, ToolSpec
+from langchain_core.messages import HumanMessage, ToolMessage
 from llm_node import agent, gateway as gw
 from tests.conftest import make_toy_node
 
@@ -110,6 +111,42 @@ def test_render_fallback_strips_raw_and_big_fields():
     assert "raw" not in text
     assert "x" * 100 not in text and "B" * 100 not in text
     assert '"n": 1' in text
+
+
+# ---------------------------------------------------------------- 历史裁剪
+
+def _tool_pair(i: int):
+    """一组完整的工具调用对：发起了调用的 AI 消息 + 工具观察。"""
+    return [
+        AIMessage(content="", tool_calls=[
+            {"name": "t", "args": {}, "id": f"c{i}", "type": "tool_call"},
+        ]),
+        ToolMessage(content="观察", tool_call_id=f"c{i}"),
+    ]
+
+
+def test_trim_history_keeps_pairs_intact():
+    """裁剪点落在工具调用对上时，回退到最近的干净边界。"""
+    from langchain_core.messages import ToolMessage
+
+    msgs = [HumanMessage(content=f"问{i}") for i in range(4)]
+    for i in range(4):
+        msgs += _tool_pair(i)
+        msgs.append(AIMessage(content=f"答{i}"))
+    # 16 条，max=9 → 朴素切割点落在工具对中间
+    trimmed = agent.trim_history(msgs, 9)
+    # 首条必须是干净边界（不能是工具观察或发起调用的 AI 消息）
+    assert trimmed[0].type != "tool"
+    assert not getattr(trimmed[0], "tool_calls", None)
+    # 不存在「前面没有发起调用的 AI 消息」的孤立 ToolMessage
+    for i, m in enumerate(trimmed):
+        if m.type == "tool":
+            assert trimmed[i - 1].tool_calls, f"孤立 ToolMessage @ {i}"
+
+
+def test_trim_history_short_passthrough():
+    msgs = [HumanMessage(content="a"), AIMessage(content="b")]
+    assert agent.trim_history(msgs, 12) == msgs
 
 
 # ---------------------------------------------------------------- mock 对话

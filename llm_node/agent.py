@@ -32,7 +32,7 @@ from common.schemas import ToolSpec
 from llm_node import llm
 
 #: 工具调用循环上限。超出按 GraphRecursionError 处理，给用户可读的回复
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 10
 
 #: 网关注入的调用函数：(tool, image, params) -> InvokeResponse，可抛 GatewayError
 InvokeFn = Callable[[str, str | None, dict[str, Any]], Awaitable[Any]]
@@ -325,6 +325,27 @@ async def run_chat(
     return reply, tool_calls, new_msgs
 
 
+def trim_history(messages: list[BaseMessage], max_messages: int) -> list[BaseMessage]:
+    """按条数裁剪历史，但绝不把一次工具调用对拦腰切断。
+
+    超限时从尾部保留 max_messages 条；若切割点落在「发起了调用的 AI 消息」
+    或「工具观察消息」上，就向前回退到最近的干净边界（用户消息或普通
+    AI 回答之后），否则模型会看到一段没有来由的观察文本。
+    """
+    if len(messages) <= max_messages:
+        return list(messages)
+
+    def is_dirty(msg: BaseMessage) -> bool:
+        if msg.type == "tool":
+            return True
+        return bool(getattr(msg, "tool_calls", None))
+
+    start = len(messages) - max_messages
+    while start > 0 and is_dirty(messages[start]):
+        start -= 1
+    return list(messages[start:])
+
+
 # ---------------------------------------------------------------- mock 模式
 
 async def mock_chat(
@@ -340,3 +361,4 @@ async def mock_chat(
     if tool_calls:
         reply += f"，并模拟调用了 {tool_calls[0]['tool']}"
     return reply, tool_calls
+

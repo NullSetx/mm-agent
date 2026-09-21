@@ -86,9 +86,11 @@ async def test_chat_real_loop_end_to_end(gateway, router, monkeypatch):
         {"tool": "echo", "ok": True, "result": {"pong": True}, "error": None}
     ]
 
-    # 会话历史被回填（tool_call 消息 + 工具回填 + 最终回答）
+    # 会话历史包含用户消息（P0：多轮上下文不再丢用户的话）+ 工具消息
     session = router["_app"].state.sessions.get("s2")
-    assert len(session.history) == 3
+    assert len(session.history) == 4
+    assert session.history[0].type == "human"
+    assert session.history[0].content == "测试一下"
 
 
 @pytest.mark.anyio
