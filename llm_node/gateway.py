@@ -6,7 +6,8 @@
 - 转发：POST /api/invoke 按路由表透传到所属节点，错误按约定映射
   （未知工具 404 / 下游不可达 502 / 超时 504）。
 - 对话：POST /api/chat 编排 LangChain Agent（llm_node.agent），可带图，
-  支持按 session_id 续聊（内存会话）。
+  支持按 session_id 续聊（内存会话）；请求带 `stream=true` 时改走 SSE。
+- 跨域：放行各成员前端展示页的浏览器直连（CORS），来源见 CORS_ALLOW_ORIGINS。
 
 启动：uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000
 """
@@ -14,8 +15,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +27,8 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from langgraph.errors import GraphRecursionError
 from openai import APIConnectionError, APITimeoutError
 from pydantic import BaseModel, Field
@@ -41,6 +46,15 @@ VISION_NODES: tuple[str, ...] = ("vision-fast", "vision-heavy")
 _DISCOVER_TIMEOUT = 5.0  # 发现 /health 探测的兜底超时（秒）
 _HEALTH_TIMEOUT = 3.0
 _CONNECT_TIMEOUT = 5.0
+
+#: 允许跨域的前端来源。前端是各成员自己的展示页，与网关不同源，浏览器直连
+#: 需要 CORS。默认放开（内网演示）；公网部署时应改成具体来源，逗号分隔。
+#: 注意：允许来源为 "*" 时不能同时带凭证，故下面 allow_credentials=False。
+CORS_ALLOW_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
+]
+
+log = logging.getLogger("llm_node.gateway")
 
 #: 会话历史保留的最大消息条数（含工具消息）
 MAX_HISTORY_MESSAGES = 12
@@ -249,11 +263,110 @@ class ChatRequest(BaseModel):
     image: str | None = Field(
         default=None, description="base64，可带 data: 前缀；作为本会话当前图片"
     )
+    stream: bool = Field(
+        default=False,
+        description="true 时以 SSE 流式返回（data: {type: delta|tool|done|error}）；"
+        "默认 false 保持一次性的 JSON 响应",
+    )
 
 
 class ChatResponse(BaseModel):
     reply: str
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+
+#: SSE 响应头：关掉中间层缓冲，否则流会被攒成一坨再吐出来
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse(payload: dict[str, Any]) -> str:
+    """把一条事件编码成 SSE 帧。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_events(
+    http: httpx.AsyncClient,
+    catalog: ToolCatalog,
+    session: Session,
+    req: ChatRequest,
+) -> AsyncIterator[str]:
+    """流式对话的 SSE 事件源。
+
+    事件类型：`delta`（文本增量）/ `tool`（一条工具记录）/ `done`（结束，
+    带完整 reply）/ `error`。
+
+    注意：异常发生在响应头已经发出之后，没法再改 HTTP 状态码（504/502），
+    所以流里的失败一律以 `error` 事件表达——这是 SSE 的固有限制。
+    """
+    def invoke(tool: str, image: str | None, params: dict[str, Any]) -> Any:
+        return invoke_tool(http, catalog, tool, image, params)
+
+    if mock_enabled():
+        reply, records = await agent.mock_chat(req.message, session.image, catalog.specs())
+        yield _sse({"type": "delta", "text": reply})
+        for r in records:
+            yield _sse({"type": "tool", **r})
+        yield _sse({"type": "done", "reply": reply, "tool_calls": records})
+        return
+
+    # 只在**这一轮上传了新图**时预取。会话图会跨轮留存，若按 session.image
+    # 判断，用户之后随便说句"谢谢你"都会把 detect/classify/ocr 重跑一遍，
+    # 而且观察被重新注入会把模型带偏成继续描述图片。
+    observations, prefetch = None, []
+    if req.image and session.image:
+        observations, prefetch = await _prefetch_observations(http, catalog, session.image)
+    collected: list[dict[str, Any]] = list(prefetch)
+    for r in prefetch:
+        yield _sse({"type": "tool", **r})
+
+    try:
+        async for ev in agent.stream_chat(
+            session.history,
+            req.message,
+            req.image,  # 只在本轮附图；追问轮靠历史里那张图
+            agent.build_tools(catalog.specs(), invoke),
+            observations=observations,
+            tool_image=session.image,  # 追问轮模型仍可能调工具，得给着图
+        ):
+            if ev["type"] == "final":
+                session.history = (
+                    session.history + list(ev["messages"])
+                )[-MAX_HISTORY_MESSAGES:]
+                yield _sse(
+                    {"type": "done", "reply": ev["reply"], "tool_calls": collected}
+                )
+                return
+            if ev["type"] == "ping":
+                # SSE 注释帧：只为保活，前端解析器（只认 data: 行）自动忽略
+                yield ": keepalive\n\n"
+                continue
+            if ev["type"] == "tool":
+                collected.append({k: v for k, v in ev.items() if k != "type"})
+            yield _sse(ev)
+    except GraphRecursionError:
+        yield _sse({
+            "type": "error",
+            "message": f"工具调用轮数超过上限（{agent.MAX_TOOL_ROUNDS}），请简化问题或稍后再试。",
+        })
+    except APITimeoutError as exc:
+        yield _sse({"type": "error", "message": f"LLM 响应超时：{exc}"})
+    except APIConnectionError as exc:
+        yield _sse({
+            "type": "error",
+            "message": f"LLM 服务不可达（{llm.vllm_base_url()}），请先启动 vLLM：{exc}",
+        })
+    except Exception as exc:  # noqa: BLE001
+        # 兜底：响应头早已发出，异常若直接抛出去会掐断连接，浏览器只看到一句
+        # 无从下手的 "Load failed"。转成 error 事件，前端能显示原因，日志留全栈。
+        log.exception("流式对话失败")
+        yield _sse({
+            "type": "error",
+            "message": f"生成中断：{type(exc).__name__}: {exc}",
+        })
 
 
 # ---------------------------------------------------------------- 应用工厂
@@ -273,6 +386,15 @@ def build_app() -> FastAPI:
             await app.state.http.aclose()
 
     app = FastAPI(title="mm-agent gateway", version="1.0", lifespan=lifespan)
+    # 前端（各成员自己的展示页）与网关不同源，浏览器直连要放行跨域。
+    # 加在最外层，OPTIONS 预检由中间件直接应答。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOW_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.state.catalog = ToolCatalog()
     app.state.last_refresh: dict[str, Any] = {}
     app.state.sessions = SessionStore()
@@ -358,23 +480,34 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     @app.post("/api/chat", response_model=ChatResponse)
-    async def chat(req: ChatRequest, request: Request) -> ChatResponse:
-        """对话主入口。可带图；同一 session_id 多轮续聊。"""
+    async def chat(req: ChatRequest, request: Request) -> Any:
+        """对话主入口。可带图；同一 session_id 多轮续聊。
+
+        `stream=true` 时返回 SSE（见 `_stream_events`），否则返回一次性 JSON。
+        """
         http: httpx.AsyncClient = request.app.state.http
         catalog: ToolCatalog = request.app.state.catalog
         session = request.app.state.sessions.get(req.session_id)
         if req.image:
             session.image = req.image
+
+        if req.stream:
+            return StreamingResponse(
+                _stream_events(http, catalog, session, req),
+                media_type="text/event-stream",
+                headers=SSE_HEADERS,
+            )
+
         specs = catalog.specs()
 
         if mock_enabled():
             reply, records = await agent.mock_chat(req.message, session.image, specs)
             return ChatResponse(reply=reply, tool_calls=records)
 
-        # 带图请求：网关先确定性预取分析类观察（成员确认的架构），
-        # 模型只需依据观察回答；stylize 等生成式工具仍由模型自主调用
+        # 只在**这一轮上传了新图**时预取（与流式路径同一判断，理由见 _stream_events）；
+        # stylize 等生成式工具仍由模型自主调用
         observations, prefetch_records = None, []
-        if session.image:
+        if req.image and session.image:
             observations, prefetch_records = await _prefetch_observations(
                 http, catalog, session.image
             )
@@ -384,9 +517,10 @@ def build_app() -> FastAPI:
 
         try:
             reply, records, new_msgs = await agent.run_chat(
-                session.history, req.message, session.image,
+                session.history, req.message, req.image,
                 agent.build_tools(specs, invoke),
                 observations=observations,
+                tool_image=session.image,
             )
         except GraphRecursionError:
             return ChatResponse(
