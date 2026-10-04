@@ -50,13 +50,23 @@ uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
 跑真实模型：
 
 ```bash
-./scripts/mm-agent.sh start --with-vllm   # 网关 + 两个视觉节点 + vLLM
+# 网关 + 两个视觉节点 + vLLM
+./scripts/mm-agent.sh start --with-vllm --model weights/Qwen3-VL-4B-Instruct-AWQ-4bit
+
 ./scripts/mm-agent.sh status              # 看谁在跑
 ./scripts/mm-agent.sh stop
 ```
 
+`--model` 指向 `weights/` 下的权重目录即可，**服务名和 chat template 会自动推导**：
+
+- 服务名 = 目录名小写，并且**同一个名字也喂给网关**，所以两边不可能对不上
+- chat template 优先用**该模型目录自带的** `chat_template.jinja`（Qwen3-VL 必须用
+  自带的；仓库里那份是 Qwen2.5 专用，混用会让模型看不到工具定义）
+
+不传 `--model` 时用 `VLLM_MODEL_PATH`，再没有就退回 Qwen2.5 的默认路径。
+
 > vLLM 在**另一个 venv**里（它和仓库 `.venv` 依赖冲突，装不到一起）。
-> 默认找 `~/vllm-venv`，用 `VLLM_VENV=/path/to/venv` 覆盖。详见
+> 脚本默认找 `~/vllm-venv`，用 `VLLM_VENV=/path/to/venv` 覆盖。详见
 > [llm_node/README.md](llm_node/README.md#vllm网关机器专用)。
 
 ### 手动起

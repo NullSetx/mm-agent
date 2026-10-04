@@ -34,26 +34,54 @@ VLLM_PORT="${VLLM_PORT:-8001}"
 # 单机四进程共用一张卡，默认压到 0.5；只有 vLLM 独占整卡时才可以调高
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.5}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
-VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-$ROOT/weights/Qwen2.5-VL-3B-Instruct-AWQ}"
-VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-qwen2.5-vl-3b-awq}"
-VLLM_CHAT_TEMPLATE="${VLLM_CHAT_TEMPLATE:-$ROOT/llm_node/qwen25_tools_chat_template.jinja}"
+VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-}"          # 空 = 用下面的默认；见参数解析后的解析逻辑
+VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-}"          # 空 = 按模型目录名推导
+VLLM_CHAT_TEMPLATE="${VLLM_CHAT_TEMPLATE:-}"    # 空 = 优先用模型目录自带的那份
 
-# 子进程要能读到这些（网关发现视觉节点时走 common.config.PORTS，读的就是环境变量）
 export GATEWAY_PORT VISION_FAST_PORT VISION_HEAVY_PORT VLLM_PORT VLLM_MODEL_NAME
 
 MOCK=0
 WITH_VLLM=0
 CMD=""
-for arg in "$@"; do
-  case "$arg" in
+MODEL_ARG=""
+while (( $# )); do
+  case "$1" in
     --mock)      MOCK=1 ;;
     --with-vllm) WITH_VLLM=1 ;;
-    start|stop|restart|status) CMD="$arg" ;;
+    --model)     shift; MODEL_ARG="${1:-}" ;;
+    --model=*)   MODEL_ARG="${1#--model=}" ;;
+    start|stop|restart|status) CMD="$1" ;;
     -h|--help)   CMD="help" ;;
-    *) echo "未知参数：$arg（用 -h 看帮助）" >&2; exit 1 ;;
+    *) echo "未知参数：$1（用 -h 看帮助）" >&2; exit 1 ;;
   esac
+  shift
 done
 CMD="${CMD:-start}"
+
+# ---- 模型相关参数解析 -------------------------------------------------------
+# --model 优先于 VLLM_MODEL_PATH；都没给就退回文档里的 Qwen2.5 默认路径。
+[[ -n "$MODEL_ARG" ]] && VLLM_MODEL_PATH="$MODEL_ARG"
+if [[ -z "$VLLM_MODEL_PATH" ]]; then
+  VLLM_MODEL_PATH="$ROOT/weights/Qwen2.5-VL-3B-Instruct-AWQ"
+elif [[ "$VLLM_MODEL_PATH" != /* ]]; then
+  VLLM_MODEL_PATH="$ROOT/$VLLM_MODEL_PATH"    # 允许传相对仓库根目录的路径
+fi
+
+# 服务名：没显式给就按目录名推。关键不是取什么名，而是 vLLM 的
+# --served-model-name 和网关的 VLLM_MODEL_NAME **必须是同一个**，否则模型调不动。
+[[ -z "$VLLM_MODEL_NAME" ]] && \
+  VLLM_MODEL_NAME="$(basename "$VLLM_MODEL_PATH" | tr '[:upper:]' '[:lower:]')"
+
+# chat template：**优先用模型目录自带的那份**。Qwen3-VL 系列的权重不带内嵌模板，
+# 必须外指；而仓库里那份 qwen25_tools_chat_template.jinja 只适用于 Qwen2.5，
+# 拿它套 Qwen3-VL 会让模型看不到工具定义。所以按目录里有没有来决定。
+if [[ -z "$VLLM_CHAT_TEMPLATE" ]]; then
+  if [[ -f "$VLLM_MODEL_PATH/chat_template.jinja" ]]; then
+    VLLM_CHAT_TEMPLATE="$VLLM_MODEL_PATH/chat_template.jinja"
+  else
+    VLLM_CHAT_TEMPLATE="$ROOT/llm_node/qwen25_tools_chat_template.jinja"
+  fi
+fi
 
 usage() {
   cat <<'EOF'
@@ -63,16 +91,24 @@ mm-agent 一键启动 / 停止 / 查看状态。
   ./scripts/mm-agent.sh start --mock       # mock 模式：不需要任何模型权重，秒起，
                                            #   适合只调前端的人
   ./scripts/mm-agent.sh start --with-vllm  # 连 vLLM 一起起（需要权重 + 显卡）
+  ./scripts/mm-agent.sh start --with-vllm --model weights/Qwen3-VL-4B-Instruct-AWQ-4bit
   ./scripts/mm-agent.sh stop
   ./scripts/mm-agent.sh restart
   ./scripts/mm-agent.sh status
+
+  --model DIR   指定 vLLM 加载哪个权重目录（相对仓库根目录或绝对路径）。
+                服务名与 chat template 会**自动**从它推导：
+                  · 服务名 = 目录名小写，同时喂给网关，两边必然一致
+                  · template 优先用该目录自带的 chat_template.jinja
+                    （Qwen3-VL 必须用自带的；仓库里那份是 Qwen2.5 专用）
+                不传则用 VLLM_MODEL_PATH，再没有就退回 weights 里的 Qwen2.5 默认
 
 环境变量（都有默认值）：
   MM_PY         仓库 venv 的 python，默认 <repo>/.venv/bin/python
   VLLM_VENV     vLLM 所在 venv，默认 ~/vllm-venv
   GATEWAY_PORT / VISION_FAST_PORT / VISION_HEAVY_PORT / VLLM_PORT
-  VLLM_MODEL_PATH / VLLM_MODEL_NAME / VLLM_GPU_MEMORY_UTILIZATION / VLLM_MAX_MODEL_LEN
-  VLLM_CHAT_TEMPLATE   vLLM 的 --chat-template，默认仓库里那份 Qwen2.5 的
+  VLLM_MODEL_PATH / VLLM_MODEL_NAME / VLLM_CHAT_TEMPLATE
+  VLLM_GPU_MEMORY_UTILIZATION / VLLM_MAX_MODEL_LEN
 EOF
 }
 
@@ -130,8 +166,13 @@ start_vllm() {
   if curl_ok "http://127.0.0.1:$VLLM_PORT/v1/models"; then
     warn "vLLM 已在运行，跳过"; return 0
   fi
-  log "启动 vLLM → :$VLLM_PORT  (模型 $VLLM_MODEL_NAME，日志 $LOG_DIR/vllm.log)"
-  log "  首次启动要为 sm_120 现场编译 kernel，可能要几分钟"
+  log "启动 vLLM → :$VLLM_PORT"
+  log "  权重    $VLLM_MODEL_PATH"
+  log "  服务名  $VLLM_MODEL_NAME   （网关用同一个，两边必须一致）"
+  log "  模板    $VLLM_CHAT_TEMPLATE"
+  log "  显存    gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION  max-model-len=$VLLM_MAX_MODEL_LEN"
+  log "  首次启动要为 sm_120 现场编译 kernel，可能要几分钟。日志：$LOG_DIR/vllm.log"
+  [[ -f "$VLLM_CHAT_TEMPLATE" ]] || die "chat template 不存在：$VLLM_CHAT_TEMPLATE"
   local oldpwd="$PWD"
   cd "$ROOT"
   VLLM_WSL2_ENABLE_PIN_MEMORY=1 nohup "$bin" serve "$VLLM_MODEL_PATH" \
