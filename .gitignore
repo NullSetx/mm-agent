@@ -15,6 +15,9 @@ data/
 weights/
 outputs/
 
+# 一键启动脚本的运行目录（pid / 日志），别进库
+.run/
+
 # 各人本地自用的开发/测试脚本与产物，不进仓库
 /vision_fast/smoke_test.py
 /vision_heavy/smoke_test.py
