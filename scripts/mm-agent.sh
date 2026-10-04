@@ -159,7 +159,9 @@ wait_health() {
 start_vllm() {
   local bin="$VLLM_VENV/bin/vllm"
   [[ -x "$bin" ]] || die "找不到 vLLM：$bin
-设置 VLLM_VENV 指向装了 vllm==0.26.0 的 venv（它和仓库 .venv 装不到一起）"
+用 VLLM_VENV 指定装了 vllm 的那个 venv（它和仓库 .venv 依赖冲突，装不到一起）。
+不知道在哪的话，先搜一下：
+  find \$HOME -maxdepth 5 -type f -name vllm -path '*/bin/*' 2>/dev/null"
   [[ -d "$VLLM_MODEL_PATH" ]] || die "找不到权重目录：$VLLM_MODEL_PATH
 设置 VLLM_MODEL_PATH，或先用 --mock 起（mock 不需要权重）"
   mkdir -p "$LOG_DIR" "$PID_DIR"
