@@ -15,11 +15,17 @@ mock 模式（NODE_MOCK=1，文档 §6.2「先跑通 mock 再上模型」）走 
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import contextvars
+import io
 import json
+import os
+from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable
 
 from langchain.agents import create_agent
+from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -32,7 +38,7 @@ from common.schemas import ToolSpec
 from llm_node import llm
 
 #: 工具调用循环上限。超出按 GraphRecursionError 处理，给用户可读的回复
-MAX_TOOL_ROUNDS = 10
+MAX_TOOL_ROUNDS = 5
 
 #: 网关注入的调用函数：(tool, image, params) -> InvokeResponse，可抛 GatewayError
 InvokeFn = Callable[[str, str | None, dict[str, Any]], Awaitable[Any]]
@@ -251,6 +257,39 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
     )
 
 
+#: 送给 LLM 的图片长边上限（像素）。VL 模型的视觉 token 数随分辨率平方增长：
+#: 实测一张 1600×2400 的网页截图要 6916 个 token，而 vLLM 用 --max-model-len
+#: 4096 起，直接 400 拒绝（"Input length exceeds model's maximum context length"）。
+#: 工具用的是原图（OCR/检测都靠它），只有喂给模型看的这份要缩。
+LLM_IMAGE_MAX_SIDE = int(os.getenv("LLM_IMAGE_MAX_SIDE", "1024"))
+
+
+def _shrink_image_for_llm(image: str) -> str:
+    """把 base64 图片缩到长边 LLM_IMAGE_MAX_SIDE，返回 JPEG 的 data URI。
+
+    缩得动就缩；解码失败原样返回——宁可让 vLLM 报错，也别在这里把图片弄丢
+    （丢图会让模型"看不见"却照样作答，比报错更难查）。
+    """
+    payload = image.split(",", 1)[1] if image.startswith("data:") else image
+    try:
+        from PIL import Image as PILImage
+
+        img = PILImage.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+    except Exception:  # noqa: BLE001 - 解不开就原样透传，交给下游报错
+        return image if image.startswith("data:") else f"data:image/png;base64,{image}"
+
+    w, h = img.size
+    if max(w, h) > LLM_IMAGE_MAX_SIDE:
+        scale = LLM_IMAGE_MAX_SIDE / max(w, h)
+        img = img.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))), PILImage.LANCZOS
+        )
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=88)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
 def _human_content(
     message: str, image: str | None, observations: str | None = None
 ) -> Any:
@@ -266,8 +305,7 @@ def _human_content(
     if observations:
         parts[0]["text"] += "\n\n" + observations
     if image:
-        uri = image if image.startswith("data:") else f"data:image/png;base64,{image}"
-        parts.append({"type": "image_url", "image_url": {"url": uri}})
+        parts.append({"type": "image_url", "image_url": {"url": _shrink_image_for_llm(image)}})
     return parts
 
 
@@ -279,10 +317,16 @@ async def run_chat(
     chat_model: Any = None,
     max_rounds: int = MAX_TOOL_ROUNDS,
     observations: str | None = None,
+    tool_image: str | None = None,
 ) -> tuple[str, list[dict[str, Any]], list[BaseMessage]]:
     """跑一轮对话。
 
     Args:
+        image: 要**附给本轮消息**的图片。只在用户这一轮上传了图时传，
+            后续追问轮传 None——历史里已经有那张图了，重复附上等于把
+            视觉 token 花两遍，还会让模型以为"又要我描述图片"。
+        tool_image: 工具执行时用的图片（会话当前图）。追问轮里模型仍可能
+            调工具（如风格迁移），所以这一项要一直给着。None 时退回 image。
         observations: 网关预取的工具观察文本（带图请求由网关先确定性
             调用分析类工具生成），会拼进本轮用户消息。
 
@@ -297,7 +341,7 @@ async def run_chat(
         content=_human_content(message, image, observations)
     )
 
-    token = _current_image.set(image)
+    token = _current_image.set(tool_image if tool_image is not None else image)
     records: list[dict[str, Any]] = []
     token_r = _current_records.set(records)
     try:
@@ -325,25 +369,116 @@ async def run_chat(
     return reply, tool_calls, new_msgs
 
 
-def trim_history(messages: list[BaseMessage], max_messages: int) -> list[BaseMessage]:
-    """按条数裁剪历史，但绝不把一次工具调用对拦腰切断。
+# ---------------------------------------------------------------- 流式对话
 
-    超限时从尾部保留 max_messages 条；若切割点落在「发起了调用的 AI 消息」
-    或「工具观察消息」上，就向前回退到最近的干净边界（用户消息或普通
-    AI 回答之后），否则模型会看到一段没有来由的观察文本。
+#: 流式对话的静默上限（秒）。超过就发一个 ping 事件，防止反代/隧道把空闲连接掐掉
+_HEARTBEAT_S = 10.0
+
+
+class _TokenTee(AsyncCallbackHandler):
+    """把模型吐出的每个 token 塞进队列，供流式接口边收边发。
+
+    只转发非空 token：工具调用阶段的增量是空串（参数走 tool_call_chunks，
+    不经过 on_llm_new_token），过滤掉正好只剩给用户看的回答文本。
     """
-    if len(messages) <= max_messages:
-        return list(messages)
 
-    def is_dirty(msg: BaseMessage) -> bool:
-        if msg.type == "tool":
-            return True
-        return bool(getattr(msg, "tool_calls", None))
+    def __init__(self, queue: "asyncio.Queue[str | None]") -> None:
+        self._queue = queue
 
-    start = len(messages) - max_messages
-    while start > 0 and is_dirty(messages[start]):
-        start -= 1
-    return list(messages[start:])
+    async def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
+        if token:
+            await self._queue.put(token)
+
+
+async def stream_chat(
+    history: list[BaseMessage],
+    message: str,
+    image: str | None,
+    tools: list[StructuredTool],
+    chat_model: Any = None,
+    max_rounds: int = MAX_TOOL_ROUNDS,
+    observations: str | None = None,
+    tool_image: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """`run_chat` 的流式版本，逐事件 yield：
+
+        {"type": "delta", "text": str}   回答文本增量
+        {"type": "tool", **tool_calls 里的一条记录}   工具执行完即推送
+        {"type": "final", "reply": str, "messages": [...]}
+
+    最后的 `final` 是本函数内部的终结事件，承载完整回答和本轮新增消息，
+    由调用方（网关）取走并转成对外的 done；调用方不应把 `final` 透传给前端。
+
+    实现说明（踩过的坑）：**不能**靠 langgraph 的 `stream_mode="messages"` 拿
+    token——`create_agent` 的模型节点是 `model.ainvoke(messages)`，langgraph 只
+    会吐一条完整 AIMessage，逐 token 拿不到。可行的是挂在**模型实例**上的回调：
+    `model.ainvoke` 不透传 config，挂 config 上的回调收不到 token，必须挂实例。
+    于是这里用 `ainvoke` 跑（与 run_chat 同一条路径，工具循环行为完全一致），
+    回调把 token 推队列，本生成器边收边发。
+
+    工具记录沿用 ContextVar 汇总：工具执行时会往共享的 records 追加，每收到一个
+    token 就比对长度、把新记录即时推出去，前端不必等整轮结束才看到工具卡片。
+    """
+    model = chat_model or llm.build_chat_model(streaming=True)
+    # 挂实例而非 config：见上面的说明。整体替换而非追加，避免同一模型被重复调用时回调累积
+    model.callbacks = [_TokenTee(queue := asyncio.Queue())]
+
+    agent_app = create_agent(model, tools=tools, system_prompt=_system_prompt(tools))
+    human = HumanMessage(content=_human_content(message, image, observations))
+
+    token = _current_image.set(tool_image if tool_image is not None else image)
+    records: list[dict[str, Any]] = []
+    token_r = _current_records.set(records)
+    parts: list[str] = []
+    sent = 0
+
+    async def run() -> dict[str, Any]:
+        try:
+            return await agent_app.ainvoke(
+                {"messages": [*history, human]},
+                config={"recursion_limit": max_rounds * 2 + 8},
+            )
+        finally:
+            await queue.put(None)  # 结束哨兵：无论成功失败都让消费侧退出等待
+
+    task = asyncio.create_task(run())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=_HEARTBEAT_S)
+            except asyncio.TimeoutError:
+                # 静默超过 _HEARTBEAT_S：多半在等模型 prefill/首 token。
+                # 发个心跳，免得反代/隧道把空闲的长连接掐了。
+                yield {"type": "ping"}
+                continue
+            if item is None:
+                break
+            parts.append(item)
+            yield {"type": "delta", "text": item}
+            while len(records) > sent:
+                yield {"type": "tool", **records[sent]}
+                sent += 1
+        result = await task  # 运行期异常在这里抛出，交给调用方映射成 error 事件
+    finally:
+        _current_image.reset(token)
+        _current_records.reset(token_r)
+
+    while len(records) > sent:
+        yield {"type": "tool", **records[sent]}
+        sent += 1
+
+    all_msgs: list[BaseMessage] = result["messages"]
+    new_msgs = all_msgs[len(history) + 1:]
+
+    reply = "".join(parts)
+    if not reply:
+        # 流里没拿到文本（模型只调工具没说话等），退回从消息里取最后一条
+        for msg in reversed(new_msgs):
+            if isinstance(msg, AIMessage) and msg.content:
+                reply = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
+
+    yield {"type": "final", "reply": reply, "messages": new_msgs}
 
 
 # ---------------------------------------------------------------- mock 模式
@@ -361,4 +496,3 @@ async def mock_chat(
     if tool_calls:
         reply += f"，并模拟调用了 {tool_calls[0]['tool']}"
     return reply, tool_calls
-
