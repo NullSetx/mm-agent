@@ -2,6 +2,8 @@
 
 文档 §4.1 要求：节点 IP 用环境变量注入，**不要写死在代码里**。
 端口和超时同样允许环境变量覆盖，方便换机器和调试。
+配置来源优先级：**显式环境变量 > 仓库根目录 .env > 代码默认值**；
+.env 已被 .gitignore 忽略（key 绝不进库），模板见 .env.example。
 """
 
 from __future__ import annotations
@@ -11,6 +13,22 @@ from pathlib import Path
 
 # 仓库根目录（common/ 的上一层）
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_dotenv_file() -> None:
+    """把仓库根目录的 .env 写进 os.environ（已显式设置的变量不被覆盖）。
+
+    供 key、各节点 IP 这类本地配置落盘：写一次 .env，各窗口/各节点都生效，
+    不必每个终端 setx。python-dotenv 未安装时静默跳过（不挡节点启动）。
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(ROOT / ".env")
+
+
+load_dotenv_file()
 
 # 模型权重与数据。已被 .gitignore 覆盖，各人本地准备
 DATA_DIR = ROOT / "data"
@@ -25,6 +43,7 @@ HOSTS = {
     "llm": os.getenv("LLM_HOST", "127.0.0.1"),
     "vision-fast": os.getenv("VISION_FAST_HOST", "127.0.0.1"),
     "vision-heavy": os.getenv("VISION_HEAVY_HOST", "127.0.0.1"),
+    "kb": os.getenv("KB_HOST", "127.0.0.1"),
 }
 
 #: 文档 §4.1 约定的端口
@@ -33,6 +52,7 @@ PORTS = {
     "vllm": int(os.getenv("VLLM_PORT", 8001)),
     "vision-fast": int(os.getenv("VISION_FAST_PORT", 8101)),
     "vision-heavy": int(os.getenv("VISION_HEAVY_PORT", 8102)),
+    "kb": int(os.getenv("KB_PORT", 8103)),
 }
 
 

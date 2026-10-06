@@ -57,3 +57,14 @@ openai
 # 若不使用 PaddleOCR-VL，可改用 PP-OCRv6（34.5M，纯 CPU 可跑，几乎不占显存），
 # transformers 同样内置支持，换 OCR_MODEL_ID 即可，无需额外依赖。
 transformers==5.17.0
+
+# ── kb_node（A · 知识库，16GB 节点）───────────────────────────
+# 方案见 docs/知识库方案.md：embedding 走 OpenAI 兼容 API（零额外依赖），
+# 向量库用 chromadb（A 的机器装；B/C 不装不影响各自节点，kb_node 懒加载，
+# 未装时节点照常起、kb_search 返回可读错误）。
+chromadb>=1.0.0
+# 本地兜底 embedding（KB_EMBEDDING_PROVIDER=local 时才需要，默认关）：
+# sentence-transformers>=5.0
+
+# ── 全节点共用：.env 本地配置（key / 各节点 IP，模板见 .env.example）──────
+python-dotenv>=1.0
