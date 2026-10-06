@@ -2,10 +2,12 @@
 #
 # mm-agent 一键启动 / 停止 / 查看状态。
 #
-#   ./scripts/mm-agent.sh start              # 起三个节点（网关 + 两个视觉节点）
+#   ./scripts/mm-agent.sh start              # 起四个节点（网关 + kb + 两个视觉节点）
 #   ./scripts/mm-agent.sh start --mock       # mock 模式：不需要任何模型权重，秒起，
 #                                            #   适合只调前端的人
 #   ./scripts/mm-agent.sh start --with-vllm  # 连 vLLM 一起起（需要权重 + 显卡）
+#   ./scripts/mm-agent.sh start --only kb    # 只起指定节点：kb / gateway / vision-fast /
+#                                            #   vision-heavy / vllm，逗号分隔任意组合
 #   ./scripts/mm-agent.sh stop
 #   ./scripts/mm-agent.sh status
 #   ./scripts/mm-agent.sh restart
@@ -29,6 +31,7 @@ VLLM_VENV="${VLLM_VENV:-$HOME/vllm-venv}"
 GATEWAY_PORT="${GATEWAY_PORT:-8000}"
 VISION_FAST_PORT="${VISION_FAST_PORT:-8101}"
 VISION_HEAVY_PORT="${VISION_HEAVY_PORT:-8102}"
+KB_PORT="${KB_PORT:-8103}"
 VLLM_PORT="${VLLM_PORT:-8001}"
 
 # 单机四进程共用一张卡，默认压到 0.5；只有 vLLM 独占整卡时才可以调高
@@ -38,16 +41,19 @@ VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-}"          # 空 = 用下面的默认；见
 VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-}"          # 空 = 按模型目录名推导
 VLLM_CHAT_TEMPLATE="${VLLM_CHAT_TEMPLATE:-}"    # 空 = 优先用模型目录自带的那份
 
-export GATEWAY_PORT VISION_FAST_PORT VISION_HEAVY_PORT VLLM_PORT VLLM_MODEL_NAME
+export GATEWAY_PORT VISION_FAST_PORT VISION_HEAVY_PORT KB_PORT VLLM_PORT VLLM_MODEL_NAME
 
 MOCK=0
 WITH_VLLM=0
+ONLY=""
 CMD=""
 MODEL_ARG=""
 while (( $# )); do
   case "$1" in
     --mock)      MOCK=1 ;;
     --with-vllm) WITH_VLLM=1 ;;
+    --only)      shift; ONLY="${1:-}" ;;
+    --only=*)    ONLY="${1#--only=}" ;;
     --model)     shift; MODEL_ARG="${1:-}" ;;
     --model=*)   MODEL_ARG="${1#--model=}" ;;
     start|stop|restart|status) CMD="$1" ;;
@@ -57,6 +63,7 @@ while (( $# )); do
   shift
 done
 CMD="${CMD:-start}"
+ONLY="${ONLY:-}"
 
 # ---- 模型相关参数解析 -------------------------------------------------------
 # --model 优先于 VLLM_MODEL_PATH；都没给就退回文档里的 Qwen2.5 默认路径。
@@ -87,11 +94,12 @@ usage() {
   cat <<'EOF'
 mm-agent 一键启动 / 停止 / 查看状态。
 
-  ./scripts/mm-agent.sh start              # 起三个节点（网关 + 两个视觉节点）
+  ./scripts/mm-agent.sh start              # 起四个节点（网关 + kb + 两个视觉节点）
   ./scripts/mm-agent.sh start --mock       # mock 模式：不需要任何模型权重，秒起，
                                            #   适合只调前端的人
   ./scripts/mm-agent.sh start --with-vllm  # 连 vLLM 一起起（需要权重 + 显卡）
-  ./scripts/mm-agent.sh start --with-vllm --model weights/Qwen3-VL-4B-Instruct-AWQ-4bit
+  ./scripts/mm-agent.sh start --only kb    # 只起指定节点，逗号分隔任意组合：
+                                           #   kb / gateway / vision-fast / vision-heavy / vllm
   ./scripts/mm-agent.sh stop
   ./scripts/mm-agent.sh restart
   ./scripts/mm-agent.sh status
@@ -106,7 +114,7 @@ mm-agent 一键启动 / 停止 / 查看状态。
 环境变量（都有默认值）：
   MM_PY         仓库 venv 的 python，默认 <repo>/.venv/bin/python
   VLLM_VENV     vLLM 所在 venv，默认 ~/vllm-venv
-  GATEWAY_PORT / VISION_FAST_PORT / VISION_HEAVY_PORT / VLLM_PORT
+  GATEWAY_PORT / VISION_FAST_PORT / VISION_HEAVY_PORT / KB_PORT / VLLM_PORT
   VLLM_MODEL_PATH / VLLM_MODEL_NAME / VLLM_CHAT_TEMPLATE
   VLLM_GPU_MEMORY_UTILIZATION / VLLM_MAX_MODEL_LEN
 EOF
@@ -122,6 +130,24 @@ die()  { printf '\033[31m[mm-agent]\033[0m %s\n' "$*" >&2; exit 1; }
 （网关和视觉节点共用这个 venv；vLLM 是另一个 venv，别混）"
 
 curl_ok() { curl -fsS -m 2 "$1" >/dev/null 2>&1; }
+
+# ---- 要起哪些节点 -----------------------------------------------------------
+# 默认全起（四个节点；vLLM 仅 --with-vllm 时）。--only 逗号分隔，精确到节点，
+# 例：--only kb   --only gateway   --only kb,gateway   --only vision-fast
+declare -a WANT_NODES=()
+if [[ -n "$ONLY" ]]; then
+  IFS=',' read -ra WANT_NODES <<< "$ONLY"
+  for n in "${WANT_NODES[@]}"; do
+    case "$n" in
+      kb|gateway|vision-fast|vision-heavy|vllm) ;;
+      *) die "未知节点名：$n（可选：kb / gateway / vision-fast / vision-heavy / vllm）" ;;
+    esac
+  done
+else
+  WANT_NODES=("vision-fast" "vision-heavy" "kb" "gateway")
+  (( WITH_VLLM )) && WANT_NODES+=("vllm")
+fi
+has_node() { local n; for n in "${WANT_NODES[@]}"; do [[ "$n" == "$1" ]] && return 0; done; return 1; }
 
 # 起一个 uvicorn 进程。$1=名字 $2=端口 $3=应用 $4=mock(0/1)
 #
@@ -196,28 +222,37 @@ do_start() {
   (( MOCK )) && mock=1
 
   if (( WITH_VLLM )) && (( MOCK )); then
-    warn "--with-vllm 和 --mock 互斥（mock 就是不要模型），只按 --mock 起"
+    warn "--with-vllm 和 --mock 互斥（mock 就是不要模型），vLLM 不起"
     WITH_VLLM=0
   fi
 
   if (( MOCK )); then
     log "MOCK 模式：返回占位结果，不加载任何模型（不用权重、不占显存）"
-  elif (( WITH_VLLM )); then
+  elif has_node vllm; then
     start_vllm
-  else
+  elif has_node gateway; then
     curl_ok "http://127.0.0.1:$VLLM_PORT/v1/models" \
-      || warn "vLLM(:$VLLM_PORT) 没起，/api/chat 会报「LLM 服务不可达」。
-       要么加 --with-vllm，要么先自己起 vLLM；只想看界面就加 --mock"
+      || warn "本机 :$VLLM_PORT 没探到 vLLM——若 vLLM 在远端属正常（记得 LLM_HOST 指过去），
+       否则 /api/chat 会报「LLM 服务不可达」；只想看界面就加 --mock"
   fi
 
-  # 顺序有讲究：网关启动时会去发现两个视觉节点的工具
-  spawn vision-fast  "$VISION_FAST_PORT"  "vision_fast.server:app"   "$mock"
-  spawn vision-heavy "$VISION_HEAVY_PORT" "vision_heavy.server:app"  "$mock"
-  wait_health "$VISION_FAST_PORT"  "/health" 120 || warn "vision-fast 健康检查超时"
-  wait_health "$VISION_HEAVY_PORT" "/health" 120 || warn "vision-heavy 健康检查超时"
-
-  spawn gateway "$GATEWAY_PORT" "llm_node.gateway:app" "$mock"
-  wait_health "$GATEWAY_PORT" "/api/health" 60 || warn "网关健康检查超时"
+  if has_node vision-fast; then
+    spawn vision-fast  "$VISION_FAST_PORT"  "vision_fast.server:app"   "$mock"
+    wait_health "$VISION_FAST_PORT"  "/health" 120 || warn "vision-fast 健康检查超时"
+  fi
+  if has_node vision-heavy; then
+    spawn vision-heavy "$VISION_HEAVY_PORT" "vision_heavy.server:app"  "$mock"
+    wait_health "$VISION_HEAVY_PORT" "/health" 120 || warn "vision-heavy 健康检查超时"
+  fi
+  if has_node kb; then
+    spawn kb-node "$KB_PORT" "kb_node.server:app" "$mock"
+    wait_health "$KB_PORT" "/health" 60 || warn "kb-node 健康检查超时"
+  fi
+  if has_node gateway; then
+    # 顺序有讲究：网关启动时会去发现各工具节点的工具，放在最后起
+    spawn gateway "$GATEWAY_PORT" "llm_node.gateway:app" "$mock"
+    wait_health "$GATEWAY_PORT" "/api/health" 60 || warn "网关健康检查超时"
+  fi
 
   echo
   log "启动完成。健康状态："
@@ -247,7 +282,7 @@ print("  all_ok   ", d.get("all_ok"), "（mock 模式下 vllm 未起，all_ok=fa
 
 do_stop() {
   local stopped=0
-  for name in gateway vision-heavy vision-fast vllm; do
+  for name in gateway kb-node vision-heavy vision-fast vllm; do
     local f="$PID_DIR/$name.pid"
     [[ -f "$f" ]] || continue
     local pid; pid="$(cat "$f")"
@@ -272,6 +307,7 @@ do_status() {
   check "vllm"          "http://127.0.0.1:$VLLM_PORT/v1/models"
   check "vision-fast"   "http://127.0.0.1:$VISION_FAST_PORT/health"
   check "vision-heavy"  "http://127.0.0.1:$VISION_HEAVY_PORT/health"
+  check "kb-node"       "http://127.0.0.1:$KB_PORT/health"
   check "gateway"       "http://127.0.0.1:$GATEWAY_PORT/api/health"
   if curl_ok "http://127.0.0.1:$GATEWAY_PORT/api/health"; then
     echo
