@@ -11,6 +11,7 @@ from tests.conftest import TimeoutTransport, fake_vllm_transport, make_toy_node
 
 FAST = gw.node_url("vision-fast")
 HEAVY = gw.node_url("vision-heavy")
+KB = gw.node_url("kb")
 
 
 class FakeAgentModel(FakeMessagesListChatModel):
@@ -26,8 +27,16 @@ def echo_tools() -> list[dict]:
     ]
 
 
+def kb_tools() -> list[dict]:
+    return [
+        {"name": "kb_search", "description": "检索项目知识库", "needs_image": False,
+         "params": {"query": "", "topk": 3},
+         "fn": lambda query="", topk=3: {"hits": [], "total": 0}},
+    ]
+
+
 def both_nodes(router) -> None:
-    """挂上两个各含一个工具的节点（工具名不同）。"""
+    """挂上三个各含工具的节点（工具名不同），对应真实拓扑。"""
     router[FAST] = make_toy_node("vision-fast", echo_tools())
     router[HEAVY] = make_toy_node(
         "vision-heavy",
@@ -35,6 +44,7 @@ def both_nodes(router) -> None:
           "params": {"conf": 0.25},
           "fn": lambda image, conf=0.25: {"conf": conf}}],
     )
+    router[KB] = make_toy_node("kb", kb_tools())
 
 
 @pytest.mark.anyio
@@ -44,11 +54,11 @@ async def test_refresh_aggregates_and_invoke_forwards(gateway, router):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
-    assert body["tools"] == ["echo", "slowpoke"]
+    assert body["tools"] == ["echo", "kb_search", "slowpoke"]
 
     listing = (await gateway.get("/api/tools")).json()
     spec_names = {t["name"] for t in listing["tools"]}
-    assert spec_names == {"echo", "slowpoke"}
+    assert spec_names == {"echo", "kb_search", "slowpoke"}
     # ToolSpec 原样透传，params 默认值保留
     slowpoke = next(t for t in listing["tools"] if t["name"] == "slowpoke")
     assert slowpoke["params"] == {"conf": 0.25}
@@ -89,7 +99,7 @@ async def test_refresh_node_down_drops_its_tools(gateway, router):
     assert body["ok"] is False
     assert body["nodes"]["vision-heavy"]["ok"] is False
     assert body["nodes"]["vision-heavy"]["error"] is not None
-    assert body["tools"] == ["echo"]  # 失联节点的工具被摘除
+    assert body["tools"] == ["echo", "kb_search"]  # 失联节点的工具被摘除（kb 仍在线）
 
 
 @pytest.mark.anyio
@@ -167,21 +177,11 @@ async def test_stale_catalog_returns_404_with_refresh_hint(gateway, router):
     assert "refresh" in resp.json()["detail"]
 
 
-# ---------------------------------------------------------------- OCR 意图门控
-
-def test_ocr_intent_positive():
-    for msg in ("图里写了什么？", "帮我读一下文字", "验证码是多少", "那个牌子的号码"):
-        assert gw._has_ocr_intent(msg), msg
-
-
-def test_ocr_intent_negative():
-    for msg in ("图里有什么物体？", "图里有几个人？", "这是什么品种的猫？"):
-        assert not gw._has_ocr_intent(msg), msg
-
+# ---------------------------------------------------------------- 预取范围
 
 @pytest.mark.anyio
-async def test_prefetch_skips_ocr_without_intent(gateway, router, monkeypatch):
-    """问题没有文字类意图时，预取不应包含 ocr；带意图时才预取。"""
+async def test_prefetch_only_analysis_tools(gateway, router, monkeypatch):
+    """预取只保底分析类工具；ocr 读字、echo 等其余工具留给模型自主调用。"""
     router[FAST] = make_toy_node("vision-fast", echo_tools())
     router[HEAVY] = make_toy_node("vision-heavy", [
         {"name": "ocr", "description": "识别文字", "needs_image": True,
@@ -195,15 +195,8 @@ async def test_prefetch_skips_ocr_without_intent(gateway, router, monkeypatch):
 
     resp = await gateway.post(
         "/api/chat",
-        json={"session_id": "s1", "message": "图里有什么物体？", "image": "aGk="},
-    )
-    prefetched = [t["tool"] for t in resp.json()["tool_calls"]]
-    assert "ocr" not in prefetched
-    assert "echo" not in prefetched  # 非分析类工具不进预取名单
-
-    resp = await gateway.post(
-        "/api/chat",
         json={"session_id": "s1", "message": "图里写了什么？", "image": "aGk="},
     )
     prefetched = [t["tool"] for t in resp.json()["tool_calls"]]
-    assert "ocr" in prefetched
+    assert "ocr" not in prefetched  # 读字类不预取，模型按需自主调
+    assert "echo" not in prefetched  # 非分析类工具不进预取名单

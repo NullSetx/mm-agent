@@ -19,6 +19,7 @@ from typing import Any
 
 from langchain_core.messages import (
     BaseMessage,
+    HumanMessage,
     messages_from_dict,
     messages_to_dict,
 )
@@ -78,6 +79,56 @@ class SessionStore:
             log.warning("会话 %s 历史损坏，按空历史继续：%s", session_id, exc)
             history = []
         return Session(history=history, image=image)
+
+    def exists(self, session_id: str) -> bool:
+        """会话是否落过库（get 对未知 id 返回空会话，这里用来区分 404）。"""
+        try:
+            conn = self._connect()
+            try:
+                return conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone() is not None
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return False
+
+    def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """最近更新的会话（新→旧），供前端会话选择器。
+
+        每项：session_id / updated_at / turns（用户提问数）/ preview（首条提问摘要）。
+        历史损坏的会话照常列出，只是 preview 为空——列表不能因为一条脏数据全挂。
+        """
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT session_id, updated_at, history FROM sessions "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            log.warning("会话列表读取失败：%s", exc)
+            return []
+        out: list[dict[str, Any]] = []
+        for sid, updated, history_json in rows:
+            preview, turns = "", 0
+            try:
+                msgs = messages_from_dict(json.loads(history_json))
+            except (ValueError, TypeError, KeyError):
+                msgs = []
+            for m in msgs:
+                if isinstance(m, HumanMessage):
+                    turns += 1
+                    if not preview and isinstance(m.content, str):
+                        preview = m.content[:40]
+            out.append({
+                "session_id": sid, "updated_at": updated,
+                "turns": turns, "preview": preview,
+            })
+        return out
 
     def save(self, session_id: str, session: Session) -> None:
         """write-through 落盘。失败仅告警：对话主流程不因存储问题失败。"""

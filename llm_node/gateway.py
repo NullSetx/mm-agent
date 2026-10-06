@@ -6,8 +6,7 @@
 - 转发：POST /api/invoke 按路由表透传到所属节点，错误按约定映射
   （未知工具 404 / 下游不可达 502 / 超时 504）。
 - 对话：POST /api/chat 编排 LangChain Agent（llm_node.agent），可带图，
-  支持按 session_id 续聊（内存会话）；请求带 `stream=true` 时改走 SSE。
-- 跨域：放行各成员前端展示页的浏览器直连（CORS），来源见 CORS_ALLOW_ORIGINS。
+  支持按 session_id 续聊（内存会话）。
 
 启动：uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000
 """
@@ -21,7 +20,6 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,35 +27,41 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.errors import GraphRecursionError
-from openai import APIConnectionError, APITimeoutError
+from openai import APIConnectionError, APITimeoutError, APIStatusError
 from pydantic import BaseModel, Field
 
-from common.config import TOOL_TIMEOUT, mock_enabled
+from common.config import DATA_DIR, TOOL_TIMEOUT, mock_enabled
 from common.schemas import InvokeRequest, InvokeResponse, ToolSpec, ToolList
 from llm_node import agent, llm
+from llm_node.sessions import SessionStore
 
 #: 测试台静态页（浏览器打开 http://<网关>:8000/ 即是）
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-#: 接进网关的视觉节点。新增节点：config.HOSTS/PORTS 加键 + 这里加名字
-VISION_NODES: tuple[str, ...] = ("vision-fast", "vision-heavy")
+#: 接进网关的工具节点（vision 两节点 + kb 知识库）。
+#: 新增节点：config.HOSTS/PORTS 加键 + 这里加名字
+VISION_NODES: tuple[str, ...] = ("vision-fast", "vision-heavy", "kb")
 
 _DISCOVER_TIMEOUT = 5.0  # 发现 /health 探测的兜底超时（秒）
 _HEALTH_TIMEOUT = 3.0
 _CONNECT_TIMEOUT = 5.0
 
-#: 允许跨域的前端来源。前端是各成员自己的展示页，与网关不同源，浏览器直连
-#: 需要 CORS。默认放开（内网演示）；公网部署时应改成具体来源，逗号分隔。
-#: 注意：允许来源为 "*" 时不能同时带凭证，故下面 allow_credentials=False。
+#: 会话历史保留的最大消息数（含工具消息）
+MAX_HISTORY_MESSAGES = 12
+
+#: 需要 CORS。默认放开（内网演示）；公网部署时应改成具体来源，逗号分隔
 CORS_ALLOW_ORIGINS = [
     o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
 ]
 
-log = logging.getLogger("llm_node.gateway")
-
-#: 会话历史保留的最大消息条数（含工具消息）
-MAX_HISTORY_MESSAGES = 12
+#: SSE 响应头：关掉中间层缓冲，否则流会被攒成一坨再吐出来
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
 
 
 def node_url(node: str) -> str:
@@ -72,18 +76,22 @@ def node_url(node: str) -> str:
 
 
 #: 带图请求网关自动预取的分析类工具（并行调用）。
-#: 生成式工具（stylize）不预取，仍由 LLM 按用户意图自主调用。
-ANALYSIS_TOOLS: tuple[str, ...] = ("detect", "classify", "ocr")
+#: 读字（ocr）、生成（stylize）不预取：ocr 慢且多数图没文字，由 LLM 按系统
+#: 提示的决策策略自主调用（agent._system_prompt 规则 4）。
+ANALYSIS_TOOLS: tuple[str, ...] = ("detect", "classify")
 
 
 async def _prefetch_observations(
-    http: httpx.AsyncClient, catalog: ToolCatalog, image: str
+    http: httpx.AsyncClient,
+    catalog: ToolCatalog,
+    image: str,
 ) -> tuple[str, list[dict[str, Any]]]:
     """带图请求先确定性调用分析类工具，把润色后的观察文本注入上下文。
 
     成员确认的架构：图片分析不赌 LLM 自觉调工具——网关直接并行调用
     当前可用的分析类工具（render_for_llm 润色），模型拿到的就是
     整理好的观察，照着回答即可。
+    读字（ocr）、生成（stylize）不预取，由模型按需自主调用。
     返回 (观察文本, 预取的工具调用记录)。
     """
     available = {s.name for s in catalog.specs()}
@@ -236,24 +244,34 @@ async def invoke_tool(
 
 
 # ---------------------------------------------------------------- 会话
+# Session / SessionStore 见 llm_node/sessions.py（SQLite 持久化）。
 
-@dataclass
-class Session:
-    """一个会话 = 消息历史 + 当前图片（每次传图覆盖，最近一张为准）。"""
+def _history_view(history: list[Any]) -> list[dict[str, Any]]:
+    """把会话历史压成前端可重放的视图。
 
-    history: list[Any] = field(default_factory=list)
-    image: str | None = None
-
-
-class SessionStore:
-    """内存会话表。进程重启即失效——文档未要求持久化，先不做。"""
-
-    def __init__(self) -> None:
-        self._sessions: dict[str, Session] = {}
-
-    def get(self, session_id: str) -> Session:
-        return self._sessions.setdefault(session_id, Session())
-
+    工具结果消息（ToolMessage）不单列——前端重放时 AI 消息上带一条
+    「调用了 xx 工具」的小字即可，完整 JSON 只在实时对话里有意义。
+    """
+    out: list[dict[str, Any]] = []
+    for m in history:
+        if isinstance(m, HumanMessage):
+            out.append({
+                "role": "user",
+                "text": m.content if isinstance(m.content, str) else "",
+            })
+        elif isinstance(m, AIMessage):
+            item: dict[str, Any] = {
+                "role": "assistant",
+                "text": m.content if isinstance(m.content, str) else "",
+            }
+            calls = getattr(m, "tool_calls", None) or []
+            if calls:
+                item["tool_calls"] = [
+                    {"name": c.get("name", ""), "args": c.get("args", {})}
+                    for c in calls
+                ]
+            out.append(item)
+    return out
 
 # ---------------------------------------------------------------- 请求/响应模型
 
@@ -273,14 +291,12 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
-
-
-#: SSE 响应头：关掉中间层缓冲，否则流会被攒成一坨再吐出来
-SSE_HEADERS = {
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-}
+    history_len: int = Field(
+        default=0, description="本轮结束后会话历史条数（已按窗口裁剪）"
+    )
+    history_max: int = Field(
+        default=0, description="历史窗口上限（MAX_HISTORY_MESSAGES），0 = 未提供"
+    )
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -291,7 +307,7 @@ def _sse(payload: dict[str, Any]) -> str:
 async def _stream_events(
     http: httpx.AsyncClient,
     catalog: ToolCatalog,
-    session: Session,
+    session: Any,
     req: ChatRequest,
 ) -> AsyncIterator[str]:
     """流式对话的 SSE 事件源。
@@ -314,7 +330,7 @@ async def _stream_events(
         return
 
     # 只在**这一轮上传了新图**时预取。会话图会跨轮留存，若按 session.image
-    # 判断，用户之后随便说句"谢谢你"都会把 detect/classify/ocr 重跑一遍，
+    # 判断，用户之后随便说句"谢谢你"都会把 detect/classify 重跑一遍，
     # 而且观察被重新注入会把模型带偏成继续描述图片。
     observations, prefetch = None, []
     if req.image and session.image:
@@ -333,12 +349,21 @@ async def _stream_events(
             tool_image=session.image,  # 追问轮模型仍可能调工具，得给着图
         ):
             if ev["type"] == "final":
-                session.history = (
-                    session.history + list(ev["messages"])
-                )[-MAX_HISTORY_MESSAGES:]
-                yield _sse(
-                    {"type": "done", "reply": ev["reply"], "tool_calls": collected}
+                session.history = agent.trim_history(
+                    [
+                        *session.history,
+                        HumanMessage(content=req.message),
+                        *ev["messages"],
+                    ],
+                    MAX_HISTORY_MESSAGES,
                 )
+                yield _sse({
+                    "type": "done",
+                    "reply": ev["reply"],
+                    "tool_calls": collected,
+                    "history_len": len(session.history),
+                    "history_max": MAX_HISTORY_MESSAGES,
+                })
                 return
             if ev["type"] == "ping":
                 # SSE 注释帧：只为保活，前端解析器（只认 data: 行）自动忽略
@@ -362,7 +387,7 @@ async def _stream_events(
     except Exception as exc:  # noqa: BLE001
         # 兜底：响应头早已发出，异常若直接抛出去会掐断连接，浏览器只看到一句
         # 无从下手的 "Load failed"。转成 error 事件，前端能显示原因，日志留全栈。
-        log.exception("流式对话失败")
+        logging.getLogger("llm_node.gateway").exception("流式对话失败")
         yield _sse({
             "type": "error",
             "message": f"生成中断：{type(exc).__name__}: {exc}",
@@ -397,7 +422,7 @@ def build_app() -> FastAPI:
     )
     app.state.catalog = ToolCatalog()
     app.state.last_refresh: dict[str, Any] = {}
-    app.state.sessions = SessionStore()
+    app.state.sessions = SessionStore(DATA_DIR / "sessions.db")
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -479,6 +504,26 @@ def build_app() -> FastAPI:
         except GatewayError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
+    @app.get("/api/sessions")
+    async def list_sessions(request: Request) -> dict[str, Any]:
+        """历史会话列表（新→旧），前端会话选择器用。"""
+        return {"sessions": request.app.state.sessions.list_sessions()}
+
+    @app.get("/api/sessions/{session_id}")
+    async def session_detail(session_id: str, request: Request) -> dict[str, Any]:
+        """单个会话详情：消息历史视图 + 会话当前图片（前端切换会话时重放）。"""
+        store = request.app.state.sessions
+        if not store.exists(session_id):
+            raise HTTPException(status_code=404, detail=f"会话 {session_id!r} 不存在")
+        session = store.get(session_id)
+        return {
+            "session_id": session_id,
+            "messages": _history_view(session.history),
+            "image": session.image,
+            "history_len": len(session.history),
+            "history_max": MAX_HISTORY_MESSAGES,
+        }
+
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest, request: Request) -> Any:
         """对话主入口。可带图；同一 session_id 多轮续聊。
@@ -502,7 +547,11 @@ def build_app() -> FastAPI:
 
         if mock_enabled():
             reply, records = await agent.mock_chat(req.message, session.image, specs)
-            return ChatResponse(reply=reply, tool_calls=records)
+            request.app.state.sessions.save(req.session_id, session)
+            return ChatResponse(
+                reply=reply, tool_calls=records,
+                history_len=len(session.history), history_max=MAX_HISTORY_MESSAGES,
+            )
 
         # 只在**这一轮上传了新图**时预取（与流式路径同一判断，理由见 _stream_events）；
         # stylize 等生成式工具仍由模型自主调用
@@ -535,9 +584,28 @@ def build_app() -> FastAPI:
                 status_code=502,
                 detail=f"LLM 服务不可达（{llm.vllm_base_url()}），请先启动 vLLM：{exc}",
             ) from exc
+        except APIStatusError as exc:
+            # vLLM 有响应但拒绝了请求：404 模型名对不上 / 400 参数或图片超长 / 429 过载
+            raise HTTPException(
+                status_code=502,
+                detail=f"vLLM 返回 {exc.status_code}：{exc.message}"
+                       "（404 时先核对 VLLM_MODEL_NAME 是否与 /v1/models 里的 id 一致）",
+            ) from exc
 
-        session.history = (session.history + list(new_msgs))[-MAX_HISTORY_MESSAGES:]
-        return ChatResponse(reply=reply, tool_calls=prefetch_records + records)
+        # 历史拼装：用户消息也进历史（P0，只存文本），并按调用对对齐裁剪（P1）
+        session.history = agent.trim_history(
+            [
+                *session.history,
+                HumanMessage(content=req.message),
+                *new_msgs,
+            ],
+            MAX_HISTORY_MESSAGES,
+        )
+        request.app.state.sessions.save(req.session_id, session)
+        return ChatResponse(
+            reply=reply, tool_calls=prefetch_records + records,
+            history_len=len(session.history), history_max=MAX_HISTORY_MESSAGES,
+        )
 
     return app
 

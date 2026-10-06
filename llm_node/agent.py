@@ -127,12 +127,28 @@ def _render_stylize(r: dict[str, Any]) -> str:
     return f"已生成「{style}」风格图片{size}，图片已直接展示给用户。"
 
 
+def _render_kb_search(r: dict[str, Any]) -> str:
+    hits = r.get("hits") or []
+    if not hits:
+        return "百科知识库中没有检索到相关内容，如实告诉用户库里没有这块信息，不要编造。"
+    lines = [
+        f"{i}. 【{h.get('source') or '未知来源'}】{(h.get('text') or '').strip()}"
+        for i, h in enumerate(hits, 1)
+        if isinstance(h, dict)
+    ]
+    return (
+        f"百科知识库检索到 {len(lines)} 条相关内容（带出处，回答时引用并注明"
+        "来源；与问题无关的条目不要硬凑）：\n" + "\n".join(lines)
+    )
+
+
 #: 已知工具的观察渲染器。未来新增工具若没注册渲染器，走 _render_fallback
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "detect": _render_detect,
     "classify": _render_classify,
     "ocr": _render_ocr,
     "stylize": _render_stylize,
+    "kb_search": _render_kb_search,
 }
 
 
@@ -231,7 +247,9 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
 
     写死工具名会在节点上下线后失真：比如 detect 下线后模型仍被要求
     "看物体用 detect"，调不到就编造检测结果。动态列出真实工具，并明确
-    禁止编造，模型缺工具时才会如实说"该功能暂未接入"。
+    禁止编造，模型缺工具时才会如实说"该功能暂未接入"。规则 4 给出
+    "何时自主调工具"的决策策略：预取只保底分析类观察，读字（ocr）、
+    风格生成（stylize）该不该做由模型看图 + 看问题自行判断。
     """
     lines = []
     for t in tools:
@@ -246,14 +264,21 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
         "2. 只能调用上面列出的工具，禁止调用列表外的工具，更禁止编造结果；\n"
         "3. 用户消息里以「[xx 观察]」开头的段落，是系统已经替你调用工具得到的"
         "**权威结果**，直接依据它回答，不要怀疑、不要编造观察里没有的信息；\n"
-        "4. 用户的问题可能带有错误预设（例如问“有几个人”但观察显示没有人）："
+        "4. 自主决定要不要再调工具：观察已覆盖问题就直接回答，不必重复调用；"
+        "问题需要读出图中文字（写了什么、牌子、号码等）而观察里没有文字内容，"
+        "调用 ocr；用户要求把图片转成某种风格（如动漫、素描），调用 stylize；"
+        "工具列表里有 kb_search 时，凡是知识类、事实类问题（某概念是什么、"
+        "有哪些、最新、怎么用、对比等），**必须先调 kb_search 检索再回答**——"
+        "你的训练数据有截止时间，知识库内容可能更新，检索结果与你的记忆冲突时"
+        "以检索为准；\n"
+        "5. 用户的问题可能带有错误预设（例如问“有几个人”但观察显示没有人）："
         "一切以观察为准，观察里说没有就明确说没有；\n"
-        "5. 图片类工具（如风格迁移）的生成结果已直接展示给用户，你只需一句话"
+        "6. 图片类工具（如风格迁移）的生成结果已直接展示给用户，你只需一句话"
         "说明生成了什么，不要试图描述图片文件内容；\n"
-        "6. 消息里没有对应观察、且列表中没有合适工具时，如实告诉用户该功能"
+        "7. 消息里没有对应观察、且列表中没有合适工具时，如实告诉用户该功能"
         "暂未接入，不要假装完成了检测或识别；\n"
-        "7. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
-        "8. 用中文简洁回答；工具失败时如实告诉用户原因。"
+        "8. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
+        "9. 用中文简洁回答；工具失败时如实告诉用户原因。"
     )
 
 
@@ -296,8 +321,9 @@ def _human_content(
     """组 HumanMessage 内容。带图时走多模态 parts，纯文本直接用字符串省 token。
 
     observations 是网关预取的工具观察（见 gateway._prefetch）：
-    按成员确认的架构，带图请求由网关先确定性调用分析类工具，
-    把润色后的观察文本放进消息，模型依据它回答，不依赖模型自觉调工具。
+    网关对带图请求先确定性并行调用分析类工具（detect/classify）作保底，
+    润色后的观察文本放进消息，模型依据它回答；读字（ocr）、生成
+    （stylize）不预取，由模型按系统提示的决策策略自主调用。
     """
     if not image and not observations:
         return message
@@ -367,6 +393,27 @@ async def run_chat(
     tool_calls = list(records)
 
     return reply, tool_calls, new_msgs
+
+
+def trim_history(messages: list[BaseMessage], max_messages: int) -> list[BaseMessage]:
+    """按条数裁剪历史，但绝不把一次工具调用对拦腰切断。
+
+    超限时从尾部保留 max_messages 条；若切割点落在「发起了调用的 AI 消息」
+    或「工具观察消息」上，就向前回退到最近的干净边界（用户消息或普通
+    AI 回答之后），否则模型会看到一段没有来由的观察文本。
+    """
+    if len(messages) <= max_messages:
+        return list(messages)
+
+    def is_dirty(msg: BaseMessage) -> bool:
+        if msg.type == "tool":
+            return True
+        return bool(getattr(msg, "tool_calls", None))
+
+    start = len(messages) - max_messages
+    while start > 0 and is_dirty(messages[start]):
+        start -= 1
+    return list(messages[start:])
 
 
 # ---------------------------------------------------------------- 流式对话
