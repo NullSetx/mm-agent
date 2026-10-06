@@ -14,14 +14,15 @@
         │  网关  llm_node/           :8000              │
         │  /api/health  /api/tools  /api/chat(SSE)      │
         │  大模型 Agent（vLLM，OpenAI 兼容）      :8001  │
-        └───────┬──────────────────────────┬───────────┘
-                │ 工具调用                  │ 工具调用
-                ▼                          ▼
-      ┌────────────────────┐    ┌────────────────────┐
-      │ vision_fast  :8101 │    │ vision_heavy :8102 │
-      │ detect / classify  │    │ ocr / stylize      │
-      │ 模型常驻显存        │    │ 懒加载 + 空闲释放    │
-      └────────────────────┘    └────────────────────┘
+        └───────┬──────────────────┬───────────────┬────┘
+                │ 工具调用          │ 工具调用       │ 工具调用
+                ▼                  ▼               ▼
+      ┌────────────────────┐ ┌────────────────────┐ ┌──────────────────┐
+      │ vision_fast  :8101 │ │ vision_heavy :8102 │ │ kb_node    :8103 │
+      │ detect / classify  │ │ ocr / stylize      │ │ kb_search        │
+      │ 模型常驻显存        │ │ 懒加载 + 空闲释放    │ │ 检索百科+项目文档 │
+      └────────────────────┘ └────────────────────┘ │ 纯 CPU           │
+                                                    └──────────────────┘
 ```
 
 | 节点 | 目录 | 端口 | 职责 | 权重策略 |
@@ -29,6 +30,7 @@
 | 网关 | `llm_node/` | 8000 | FastAPI 网关 + LangChain Agent + vLLM | — |
 | vision-fast | `vision_fast/` | 8101 | `detect`（YOLO）/ `classify`（ResNet50） | 常驻显存 |
 | vision-heavy | `vision_heavy/` | 8102 | `ocr`（PaddleOCR-VL）/ `stylize`（Gatys+VGG19） | 懒加载，空闲释放 |
+| kb_node | `kb_node/` | 8103 | `kb_search`（检索 `wiki/` 百科词条 + `docs/` 项目文档，带来源） | 纯 CPU；详见 [kb_node/README.md](kb_node/README.md) |
 
 **加新工具不用改网关**：在所属节点用 `@tool` 声明四个字段、重启该节点、
 `POST /api/tools/refresh` 即可，Agent 会自动多出一个能调的工具。
@@ -44,18 +46,34 @@ uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
 ./scripts/mm-agent.sh start --mock      # 先跑 mock：不需要任何模型权重，秒起
 ```
 
-`--mock` 模式下所有工具返回结构合法的占位结果，**前端开发时用这个最省事**——
-不用等权重下载、不占显存。
+`--mock` 模式下所有工具（含 `kb_search`）返回结构合法的占位结果，**前端开发时
+用这个最省事**——不用等权重下载、不占显存、不需要 embedding key。
 
-跑真实模型：
+**按你的机器要跑什么，选一个模式**（都用 `./scripts/mm-agent.sh`）：
+
+| 模式 | 起什么 | 适合谁 |
+|---|---|---|
+| `start --mock` | 全部四个节点（占位结果） | 调前端 / 没有权重的人 |
+| `start` | 全部四个节点（真模型，vLLM 需已在线或 `--with-vllm`） | 本机跑全栈自测 |
+| `start --with-vllm --model weights/Qwen3-VL-4B-Instruct-AWQ-4bit` | 全部四个节点 + 本机 vLLM | 权重和显卡在本机的人 |
+| `start --only kb` / `--only gateway` / `--only kb,gateway` … | **精确到节点自选**（可选：`kb` `gateway` `vision-fast` `vision-heavy` `vllm`，逗号分隔） | 只负责部分节点的机器（联调常用） |
+
+自选节点时，不在本机的服务用环境变量指过去：
 
 ```bash
-# 网关 + 两个视觉节点 + vLLM
-./scripts/mm-agent.sh start --with-vllm --model weights/Qwen3-VL-4B-Instruct-AWQ-4bit
-
-./scripts/mm-agent.sh status              # 看谁在跑
-./scripts/mm-agent.sh stop
+LLM_HOST=<vLLM主机> VISION_FAST_HOST=<节点IP> VISION_HEAVY_HOST=<节点IP> \
+  ./scripts/mm-agent.sh start --only kb
 ```
+
+其余常用：`status`（看谁在跑）/ `stop` / `restart`。
+
+真实模式下 kb 想有内容，先入库一次（增量，改完语料重跑即可）：
+
+```bash
+KB_EMBEDDING_API_KEY=sk-... python -m kb_node.ingest   # 收录 wiki/ 百科词条 + docs/
+```
+
+没配 key 也能起，`kb_search` 会返回可读的提示（不挡其他功能）。
 
 `--model` 指向 `weights/` 下的权重目录即可，**服务名和 chat template 会自动推导**：
 
@@ -69,18 +87,24 @@ uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
 > 脚本默认找 `~/vllm-venv`，用 `VLLM_VENV=/path/to/venv` 覆盖。详见
 > [llm_node/README.md](llm_node/README.md#vllm网关机器专用)。
 
+> **Windows 下跑脚本**：用 Git Bash，且 venv 布局是 `Scripts/` 而非 `bin/`，
+> 要指一下 python：
+> `MM_PY="$PWD/.venv/Scripts/python.exe" bash scripts/mm-agent.sh start --mock`
+
 ### 手动起
 
-```bash
-# 8GB #1（B）
-uvicorn vision_fast.server:app   --host 0.0.0.0 --port 8101
-# 8GB #2（C）
-uvicorn vision_heavy.server:app  --host 0.0.0.0 --port 8102
-# 16GB（A）网关
-uvicorn llm_node.gateway:app     --host 0.0.0.0 --port 8000
-```
+每个节点都是独立进程，**按分工挑自己机器上要跑的**（都在仓库根目录执行）：
 
-跨机联调时用环境变量注入各节点 IP（**不要写死在代码里**）：
+| 节点 | 端口 | 命令 | 备注 |
+|---|---|---|---|
+| kb 知识库 | 8103 | `python -m kb_node.ingest && uvicorn kb_node.server:app --host 0.0.0.0 --port 8103` | ingest 首次/改完语料跑；需 `KB_EMBEDDING_API_KEY` |
+| 网关 | 8000 | `uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000` | 起前用环境变量指远端节点（见下） |
+| 视觉-快 | 8101 | `uvicorn vision_fast.server:app --host 0.0.0.0 --port 8101` | 需要权重在本机 |
+| 视觉-重 | 8102 | `uvicorn vision_heavy.server:app --host 0.0.0.0 --port 8102` | 需要权重在本机 |
+| vLLM | 8001 | `vllm serve <权重目录> --served-model-name <名> --chat-template <模板>` | 独立 venv 与参数见 [llm_node/README.md](llm_node/README.md#vllm网关机器专用)；或用脚本 `--with-vllm` 托管 |
+
+跨机联调时用环境变量注入各节点 IP（**不要写死在代码里**），谁的节点不在本机
+就指谁的地址：
 
 ```bash
 VISION_FAST_HOST=192.168.1.101 VISION_HEAVY_HOST=192.168.1.102 \
@@ -138,8 +162,13 @@ CORS_ALLOW_ORIGINS=http://192.168.1.50:8080,http://localhost:3000 \
 `stream: false`（默认）时返回：
 
 ```json
-{ "reply": "图中有 2 个目标……", "tool_calls": [{"tool": "detect", "ok": true, "result": {}}] }
+{ "reply": "图中有 2 个目标……", "tool_calls": [{"tool": "detect", "ok": true, "result": {}}],
+  "history_len": 8, "history_max": 12 }
 ```
+
+`history_len / history_max` 是会话历史的当前条数与窗口上限（模型每轮只看
+最近 `history_max` 条，超出的旧消息被裁掉），前端可据此标注"哪些轮已不在
+模型记忆"。
 
 `stream: true` 时响应是 **SSE**（`text/event-stream`），逐帧推送：
 
@@ -194,7 +223,8 @@ for (;;) {
 ### 两个行为约定
 
 1. **图片只在「上传的那一轮」参与分析。** 传图那轮网关会先并行调
-   `detect`/`classify`/`ocr`，把结果喂给模型；之后的追问轮（如"谢谢你"）
+   `detect`/`classify` 作保底分析，把结果喂给模型；读字（`ocr`）、生成
+   （`stylize`）由模型看问题和图片自主调用。之后的追问轮（如"谢谢你"）
    **不会重跑工具**，靠会话历史回答。所以前端一轮里只需要在用户真正选了图时
    带上 `image`。
 2. **图片别传太大。** 服务端会把喂给模型的那份缩到长边 1024，但 base64 走网络
@@ -220,11 +250,17 @@ curl -X POST http://192.168.1.100:8000/api/invoke \
 
 ## 环境变量
 
+配置三选一：临时 `$env:` / 永久 `setx` / **写进仓库根目录 `.env`**（推荐，
+`common/config.py` 自动加载，显式环境变量优先于 .env；已 gitignore 不进库，
+模板见 [.env.example](.env.example)，改完重启节点生效）。
+
 常用几个（完整表见 [llm_node/README.md](llm_node/README.md#环境变量)）：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `VISION_FAST_HOST` / `VISION_HEAVY_HOST` | `127.0.0.1` | 两个视觉节点 IP |
+| `KB_HOST` / `KB_PORT` | `127.0.0.1` / `8103` | kb 知识库节点地址 |
+| `KB_EMBEDDING_API_KEY` | 无 | kb 入库/检索用的 embedding API key（SiliconFlow 免费） |
 | `LLM_HOST` | `127.0.0.1` | vLLM 所在机器 |
 | `NODE_MOCK` | 关 | `1` = 返回占位结果，不加载模型 |
 | `CORS_ALLOW_ORIGINS` | `*` | 允许跨域的前端来源 |
@@ -239,6 +275,10 @@ curl -X POST http://192.168.1.100:8000/api/invoke \
   问题，而是网关侧抛了异常把 SSE 连接掐断了。**先看网关日志**（`./scripts/mm-agent.sh`
   起的在 `.run/logs/gateway.log`）。
 - **对话报「LLM 服务不可达」** —— vLLM 没起。只想看界面就加 `--mock`。
+- **`kb_search` 说「知识库暂为空」或报 embedding 错误** —— 前者跑一次
+  `python -m kb_node.ingest`（语料放 `wiki/` 百科词条 + `docs/` 项目文档）；
+  后者检查 `KB_EMBEDDING_API_KEY`，或换了 embedding 模型后忘了重新入库
+  （报错里会写明）。详见 [kb_node/README.md](kb_node/README.md#入库与更新)。
 - **报 `Input length ... exceeds model's maximum context length`** —— 图片太大。
   服务端已做缩图，若仍出现说明调大了 `LLM_IMAGE_MAX_SIDE` 或把
   `--max-model-len` 设小了。
@@ -246,7 +286,9 @@ curl -X POST http://192.168.1.100:8000/api/invoke \
 ## 相关文档
 
 - [docs/分工与接口约定.md](docs/分工与接口约定.md) —— **接口契约唯一依据**，改动需三人同意
+- [docs/知识库方案.md](docs/知识库方案.md) —— kb 知识库的选型与数据流设计
 - [llm_node/README.md](llm_node/README.md) —— 网关与 vLLM 细节、环境变量全表
+- [kb_node/README.md](kb_node/README.md) —— 知识库节点：入库、embedding 配置
 - [vision_fast/README.md](vision_fast/README.md) / [vision_heavy/README.md](vision_heavy/README.md) —— 两个视觉节点
 - `scripts/mm-agent.sh --help` —— 一键脚本
 
