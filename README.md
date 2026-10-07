@@ -125,6 +125,8 @@ VISION_FAST_HOST=192.168.1.101 VISION_HEAVY_HOST=192.168.1.102 \
 | POST | `/api/tools/refresh` | 重新发现工具（节点加了新工具后调） |
 | POST | `/api/invoke` | 直接调**某一个**工具，不经大模型 |
 | POST | `/api/chat` | **对话主入口**，可带图，支持 SSE 流式 |
+| GET | `/api/sessions` | 历史会话列表（会话选择器用） |
+| GET / DELETE | `/api/sessions/{id}` | 读取会话历史 / **删除会话**（不可恢复） |
 
 ### 推荐连法：浏览器直连网关
 

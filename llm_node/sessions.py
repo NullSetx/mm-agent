@@ -130,6 +130,25 @@ class SessionStore:
             })
         return out
 
+    def delete(self, session_id: str) -> bool:
+        """删除一个会话（历史与图片一并清除，不可恢复）。
+
+        返回是否真的删了（本来就不存在为 False）。
+        """
+        try:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            log.warning("会话 %s 删除失败：%s", session_id, exc)
+            return False
+
     def save(self, session_id: str, session: Session) -> None:
         """write-through 落盘。失败仅告警：对话主流程不因存储问题失败。"""
         try:

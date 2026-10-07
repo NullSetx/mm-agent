@@ -85,6 +85,16 @@ def test_exists_and_list_sessions(tmp_path):
     assert s1["updated_at"] > 0
 
 
+def test_delete_session(tmp_path):
+    """删除清掉记录；不存在返回 False；删后再 get 得到空会话。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    store.save("s1", Session(history=[HumanMessage(content="x")], image="img"))
+    assert store.delete("s1") is True
+    assert store.exists("s1") is False
+    assert store.delete("s1") is False
+    assert store.get("s1").history == []
+
+
 def test_list_sessions_corrupt_row_survives(tmp_path):
     """列表里混进一条损坏历史：该会话 preview 为空，但其余照常返回。"""
     import sqlite3

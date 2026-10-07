@@ -244,6 +244,29 @@ async def test_session_list_and_detail_endpoints(gateway, router, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_session_delete_endpoint(gateway, router, monkeypatch):
+    """DELETE /api/sessions/{id}：成功 200 + 列表消失；不存在 404。"""
+    router[FAST] = make_toy_node("vision-fast", [
+        {"name": "echo", "description": "回声", "needs_image": False,
+         "fn": lambda: {"pong": True}},
+    ])
+    await gateway.post("/api/tools/refresh")
+    monkeypatch.setattr(
+        llm, "build_chat_model",
+        lambda **kw: FakeAgentModel(responses=[AIMessage(content="好")]),
+    )
+    await gateway.post("/api/chat", json={"session_id": "del-me", "message": "嗨"})
+
+    resp = await gateway.delete("/api/sessions/del-me")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "deleted": "del-me"}
+    ids = [s["session_id"] for s in (await gateway.get("/api/sessions")).json()["sessions"]]
+    assert "del-me" not in ids
+
+    assert (await gateway.delete("/api/sessions/del-me")).status_code == 404
+
+
+@pytest.mark.anyio
 async def test_chat_stream_sse_frames(gateway, router, monkeypatch):
     """stream=true 走 SSE：text/event-stream，delta/tool/done 帧齐全。
 

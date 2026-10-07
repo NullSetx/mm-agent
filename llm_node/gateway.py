@@ -699,6 +699,14 @@ def build_app() -> FastAPI:
             "history_max": MAX_HISTORY_MESSAGES,
         }
 
+    @app.delete("/api/sessions/{session_id}")
+    async def delete_session(session_id: str, request: Request) -> dict[str, Any]:
+        """删除一个历史会话（消息历史与图片一并清除，不可恢复）。"""
+        store = request.app.state.sessions
+        if not store.delete(session_id):
+            raise HTTPException(status_code=404, detail=f"会话 {session_id!r} 不存在")
+        return {"ok": True, "deleted": session_id}
+
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest, request: Request) -> Any:
         """对话主入口。可带图；同一 session_id 多轮续聊。
