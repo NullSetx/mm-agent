@@ -50,6 +50,7 @@ code { font-family: ui-monospace, Consolas, "Courier New", monospace; font-size:
   border: 1px solid var(--line); color: var(--muted); background: #fafbfc;
 }
 .pill.ok { color: var(--ok); border-color: #bbf7d0; background: #f0fdf4; }
+.pill.warn { color: var(--warn); border-color: #fde68a; background: #fffbeb; }
 .pill.bad { color: var(--bad); border-color: #fecaca; background: #fef2f2; }
 
 .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 24px 40px; }

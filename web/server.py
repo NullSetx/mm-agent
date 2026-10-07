@@ -2,7 +2,7 @@
 
 为什么需要这一层（而不是让页面直连网关）：
 - 文档 §1 规定「前端只访问网关」，而网关（`llm_node/gateway.py`）**没有开 CORS**。
-  页面若在 :8103 直接 `fetch` 网关的 :8000，会被浏览器按跨域拦下。
+  页面若在 :8104 直接 `fetch` 网关的 :8000，会被浏览器按跨域拦下。
   在这里做同源代理后，浏览器只与本服务打交道：**零 CORS 配置、零改动 A 的目录**。
 - 所有模型调用一律走 HTTP 端口（页面 → 本服务 → 网关 → 各节点），前端不引入任何
   模型代码，也不直连 8101/8102（契约 §4.3：前端只认 `/api/*`）。
@@ -13,12 +13,14 @@
 3. `common.config` 的 `LLM_HOST` + `GATEWAY_PORT`（默认 127.0.0.1:8000）。
 
 端口与超时同样按契约风格从配置取：
-- 本服务：`WEB_HOST`（默认 0.0.0.0，必须绑 0.0.0.0 才能被同网段访问）/ `WEB_PORT`（默认 8103）
+- 本服务：`WEB_HOST`（默认 0.0.0.0，必须绑 0.0.0.0 才能被同网段访问）/ `WEB_PORT`（默认 8104。
+  **注意 8103 已被契约分配给 kb 知识库节点**（见 `common/config.py` 的 `PORTS["kb"]`），
+  所以本前端用 8104，避免单机联调时与 kb 抢端口）
 - 代理超时：`/api/chat` 用 `CHAT_TIMEOUT`(60s)，其余用 `TOOL_TIMEOUT`(30s)（文档 §4.1）
 
 启动：
 
-    uvicorn web.server:app --host 0.0.0.0 --port 8103
+    uvicorn web.server:app --host 0.0.0.0 --port 8104
 
 只读诊断：
 
@@ -58,7 +60,9 @@ def web_host() -> str:
 
 
 def web_port() -> int:
-    return int(os.getenv("WEB_PORT", "8103"))
+    # 默认 8104：8103 按契约归 kb 知识库节点（common/config.py 的 PORTS["kb"]），
+    # 本前端避开它，免得同机联调时两边抢端口。
+    return int(os.getenv("WEB_PORT", "8104"))
 
 
 def normalize_target(raw: str) -> str:

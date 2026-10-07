@@ -90,24 +90,61 @@ function nodeCard(key, title, node) {
   </div>`;
 }
 
+/* 节点显示名（端口按契约：8101 视觉-快 / 8102 视觉-重 / 8103 知识库）。
+   网关 /health 里出现什么节点就渲染什么，未知节点兜底用原名，将来加节点不用改前端。 */
+const NODE_LABEL = {
+  "vision-fast": "vision-fast :8101（B）",
+  "vision-heavy": "vision-heavy :8102（C）",
+  kb: "kb :8103（A · 知识库）",
+};
+
+/* 演示核心：网关（就是它在答）+ B 自己的视觉节点。
+   其余节点（vision-heavy / kb / vLLM）缺失只降级，不阻断工具直调——所以别拿网关的
+   all_ok 当红绿灯，否则 C 或 kb 没起时页面会误报"没准备好"。 */
+const CORE_NODES = ["vision-fast"];
+
 async function refreshHealth() {
   const grid = $("#statusGrid");
   grid.innerHTML = `<div class="node"><div class="name"><span class="dot"></span>正在探测…</div></div>`;
   try {
     const h = await api("/api/health");
+    const nodes = h.nodes || {};
     const gwTools = (h.gateway && h.gateway.tools) || [];
     const vllm = h.vllm || { ok: false };
-    const cards = [
-      nodeCard("gateway", "网关 :8000", { ok: true, tools: gwTools, elapsed_ms: null }),
-      nodeCard("vllm", "vLLM :8001", { ok: vllm.ok, tools: vllm.models || [], elapsed_ms: vllm.elapsed_ms, error: vllm.error }),
-      nodeCard("vision-fast", "vision-fast :8101（B）", h.nodes && h.nodes["vision-fast"]),
-      nodeCard("vision-heavy", "vision-heavy :8102（C）", h.nodes && h.nodes["vision-heavy"]),
-    ];
-    grid.innerHTML = cards.join("");
-    setGwState(h.all_ok ? "ok" : "bad", h.all_ok ? "全链路就绪" : "部分节点未就绪");
-    $("#statusHint").textContent = h.all_ok
-      ? "全绿。可以开始对话或直接调用工具。"
-      : "有节点未就绪：确认对应机器已启动节点、网关地址正确（演示时网关在 A 的机器上）。";
+
+    const order = ["vision-fast", "vision-heavy", "kb"];
+    const nodeNames = Object.keys(nodes).sort((a, b) => {
+      const ia = order.indexOf(a) < 0 ? 99 : order.indexOf(a);
+      const ib = order.indexOf(b) < 0 ? 99 : order.indexOf(b);
+      return ia - ib;
+    });
+
+    grid.innerHTML = [
+      nodeCard("gateway", "网关 :8000（A）", { ok: true, tools: gwTools, elapsed_ms: null }),
+      nodeCard("vllm", "vLLM :8001（A）", {
+        ok: vllm.ok, tools: vllm.models || [], elapsed_ms: vllm.elapsed_ms, error: vllm.error,
+      }),
+      ...nodeNames.map((name) => nodeCard(name, NODE_LABEL[name] || name, nodes[name])),
+    ].join("");
+
+    const down = nodeNames.filter((n) => !(nodes[n] || {}).ok);
+    const coreDown = CORE_NODES.filter((n) => !(nodes[n] || {}).ok);
+    const vllmDown = !vllm.ok;
+
+    if (h.all_ok) {
+      setGwState("ok", "全链路就绪");
+      $("#statusHint").textContent = "全绿：对话与工具直调都可以用。";
+    } else if (!coreDown.length) {
+      setGwState("warn", "可演示（核心就绪）");
+      const missing = [...(vllmDown ? ["vLLM"] : []), ...down];
+      $("#statusHint").textContent =
+        `核心就绪（网关 + vision-fast）。未启动：${missing.join("、")}` +
+        (vllmDown ? " —— 对话需要 vLLM，**工具直调仍可用**。" : "。");
+    } else {
+      setGwState("bad", "核心不可用");
+      $("#statusHint").textContent =
+        "vision-fast 未就绪：确认 B 机已启动视觉节点（:8101）、网关地址正确（演示时网关在 A 的机器上）。";
+    }
     await loadTools();
   } catch (err) {
     grid.innerHTML = `<div class="node bad"><div class="name"><span class="dot"></span>网关不可达</div>

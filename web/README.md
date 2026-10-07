@@ -5,7 +5,7 @@
 也不用改 `llm_node/`（A 的目录）。
 
 ```
-浏览器 ──同源──▶ web 前端 :8103 ──代理 /api/*──▶ 网关 :8000 ──▶ vision-fast :8101 / vision-heavy :8102
+浏览器 ──同源──▶ web 前端 :8104 ──代理 /api/*──▶ 网关 :8000 ──▶ vision-fast :8101 / vision-heavy :8102
                                                        └──────▶ vLLM :8001
 ```
 
@@ -16,7 +16,7 @@
 ```bash
 # 本机（B，8GB #1）：视觉节点 + 演示前端
 uvicorn vision_fast.server:app --host 0.0.0.0 --port 8101
-uvicorn web.server:app      --host 0.0.0.0 --port 8103
+uvicorn web.server:app      --host 0.0.0.0 --port 8104
 
 # 演示时网关跑在 A 的机器上（由 A 启动）
 uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000
@@ -27,10 +27,10 @@ uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000
 ```bash
 NODE_MOCK=1 uvicorn vision_fast.server:app --host 0.0.0.0 --port 8101
 NODE_MOCK=1 uvicorn llm_node.gateway:app   --host 0.0.0.0 --port 8000
-uvicorn web.server:app                     --host 0.0.0.0 --port 8103
+uvicorn web.server:app                     --host 0.0.0.0 --port 8104
 ```
 
-打开页面：本机 `http://127.0.0.1:8103`；同网段同学用 `http://<你的局域网IP>:8103`
+打开页面：本机 `http://127.0.0.1:8104`；同网段同学用 `http://<你的局域网IP>:8104`
 （启动日志会直接打印可用地址）。
 
 ## 端口与环境变量
@@ -38,7 +38,7 @@ uvicorn web.server:app                     --host 0.0.0.0 --port 8103
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `WEB_HOST` | `0.0.0.0` | 前端监听地址，**必须 0.0.0.0** 才能被同网段访问（文档 §4.1） |
-| `WEB_PORT` | `8103` | 前端端口。契约里的端口是 8000/8001/8101/8102，8103 为本前端新增（不改 `common/`，已在群里报备） |
+| `WEB_PORT` | `8104` | 前端端口。契约端口是 8000/8001/8101/8102，**8103 现归 kb 知识库节点**（`common/config.py` 的 `PORTS["kb"]`），本前端因此改用 8104，避免单机联调时与 kb 抢端口 |
 | `LLM_HOST` | `127.0.0.1` | **网关所在机器**。演示时填 A 机器的局域网 IP |
 | `GATEWAY_PORT` | `8000` | 网关端口（契约） |
 | `GATEWAY_URL` | 空 | 直接指定网关基址，优先级高于 `LLM_HOST`+`GATEWAY_PORT` |
@@ -47,7 +47,7 @@ uvicorn web.server:app                     --host 0.0.0.0 --port 8103
 示例：网关在 A 机上（`192.168.1.20`）时启动前端
 
 ```bash
-LLM_HOST=192.168.1.20 GATEWAY_PORT=8000 uvicorn web.server:app --host 0.0.0.0 --port 8103
+LLM_HOST=192.168.1.20 GATEWAY_PORT=8000 uvicorn web.server:app --host 0.0.0.0 --port 8104
 ```
 
 ### 代理目标是动态的
@@ -81,7 +81,7 @@ LLM_HOST=192.168.1.20 GATEWAY_PORT=8000 uvicorn web.server:app --host 0.0.0.0 --
 根 README（A 维护）现在写的是「前端由各人自己写，不需要写后端代理，网关已开 CORS，浏览器可以直连」。
 本目录**仍然保留这一层代理**，但理由不再是 CORS，而是：
 
-- 一个地址同时提供**静态页**与 `/api`（同学只需访问 `http://<B机IP>:8103`，不用记两个端口）；
+- 一个地址同时提供**静态页**与 `/api`（同学只需访问 `http://<B机IP>:8104`，不用记两个端口）；
 - 网关地址在服务端可配（`GATEWAY_URL` / `LLM_HOST` / `GATEWAY_PORT`），页面顶部还能临时改，演示当天换 IP 不用重新发前端；
 - 不依赖任何 CORS 配置，换环境不容易踩坑。
 
@@ -103,13 +103,13 @@ python web/smoke_test.py          # 一条命令起 mock 三件套并走代理�
 
 1. **Windows 防火墙**：首次启动会弹「是否允许」，选**专用网络**；或用管理员命令放行（每台机开自己的端口）
    ```bat
-   netsh advfirewall firewall add rule name="mm-agent 8103" dir=in action=allow protocol=TCP localport=8103
+   netsh advfirewall firewall add rule name="mm-agent 8104" dir=in action=allow protocol=TCP localport=8104
    ```
-   A 的机器放行 8000，C 的机器放行 8102，B 的机器放行 8101 与 8103。
+   A 的机器放行 8000，C 的机器放行 8102，B 的机器放行 8101 与 8104。
 2. **校园网可能有 AP 隔离**：连着同一个 SSID 也可能互相 ping 不通。演示前先用手机开热点、或把三台机器接到同一台交换机/路由器上自测；页面「节点状态」能直接反映谁没通。
 3. **无外网也能用**：页面零 CDN 依赖，所有资源本地加载。
 4. **没有鉴权**（按约定不做口令）：同网段任何人打开地址都能用，仅适合演示场景。
-5. 手机浏览器同样可访问，建议把 `http://<B机IP>:8103` 生成二维码方便同学扫码体验。
+5. 手机浏览器同样可访问，建议把 `http://<B机IP>:8104` 生成二维码方便同学扫码体验。
 
 ## 契约与边界
 

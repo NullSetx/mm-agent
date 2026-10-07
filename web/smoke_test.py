@@ -4,8 +4,10 @@
 
     python web/smoke_test.py
 
-它会依次启动：vision_fast(:8101, NODE_MOCK=1) → 网关(:8000, NODE_MOCK=1) → 本前端(:8103)，
+它会依次启动：vision_fast(:8101, NODE_MOCK=1) → 网关(:8000, NODE_MOCK=1) → 本前端(:8104)，
 然后**只经过前端代理**打一遍接口，最后把服务全部关掉。不需要模型权重、不需要 vLLM。
+
+（前端默认 8104：8103 按契约归 kb 知识库节点。）
 
 默认使用契约端口；端口被占时用环境变量改（脚本会自动透传给三个服务）：
     WEB_PORT=18103 GATEWAY_PORT=18000 VISION_FAST_PORT=18101 python web/smoke_test.py
@@ -28,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8000"))
 FAST_PORT = int(os.getenv("VISION_FAST_PORT", "8101"))
-WEB_PORT = int(os.getenv("WEB_PORT", "8103"))
+WEB_PORT = int(os.getenv("WEB_PORT", "8104"))
 WEB = f"http://127.0.0.1:{WEB_PORT}"
 
 results: list[tuple[str, bool, str]] = []
