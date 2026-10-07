@@ -112,7 +112,11 @@ def local_ipv4() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient(follow_redirects=True)
+    # trust_env=False：**不读 HTTP_PROXY/HTTPS_PROXY 等环境变量代理**。
+    # 本服务就是一层代理，转发目标是局域网里的网关，必须直连；否则机器上一旦设了
+    # 环境代理（本机就设了 HTTP_PROXY=127.0.0.1:xxxxx），请求会被那个代理截走，
+    # 表现为「网关不可达」或收到无关的 502 文本响应。
+    app.state.http = httpx.AsyncClient(follow_redirects=True, trust_env=False)
     port = web_port()
     log.info("演示前端已启动：本机 http://127.0.0.1:%s", port)
     for ip in local_ipv4():

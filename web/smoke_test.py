@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -36,6 +37,19 @@ results: list[tuple[str, bool, str]] = []
 def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((name, ok, detail))
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""), flush=True)
+
+
+def dead_port() -> int:
+    """拿一个当前必定没人监听的端口，用于验证「目标不可达 → 502」。
+
+    不用写死 9 之类的端口：那台机器上若设了环境代理（HTTP_PROXY），连不通的地址会
+    被代理截走并返回它自己的响应，断言就失去意义。这里现找一个空闲端口更稳。
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def http(method: str, url: str, body=None, headers=None, timeout=90):
@@ -202,10 +216,11 @@ def main() -> int:
         check("未知工具 → 404（错误码按契约透传）", status == 404, f"HTTP {status}")
 
         print("\n=== 动态代理目标 ===", flush=True)
-        status, raw = http("GET", f"{WEB}/api/health", headers={"X-Gateway-Target": "127.0.0.1:9"})
+        gone = dead_port()
+        status, raw = http("GET", f"{WEB}/api/health", headers={"X-Gateway-Target": f"127.0.0.1:{gone}"})
         detail = (as_json(raw) or {}).get("detail", "")
-        check("请求头指定的错误目标 → 502（证明目标按请求动态解析）",
-              status == 502 and "网关不可达" in detail, f"HTTP {status}")
+        check(f"请求头指定的错误目标 → 502（证明目标按请求动态解析；目标 127.0.0.1:{gone}）",
+              status == 502 and "网关不可达" in detail, f"HTTP {status}: {str(detail)[:70]}")
         status, raw = http("GET", f"{WEB}/api/health")
         check("去掉请求头后自动回到默认目标", status == 200, f"HTTP {status}")
 

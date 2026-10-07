@@ -8,6 +8,7 @@ const state = {
   target: localStorage.getItem("gwTarget") || "",   // 空的则用服务端默认（GATEWAY_URL / common.config）
   image: null,                                       // data:image/jpeg;base64,...（对话与工具共用）
   imageName: "",
+  imageDirty: false,                                 // 图片是否需要随下一条消息发给网关
   tools: [],
   lastBoxes: null,                                   // 最近一次 detect 的框，缩放时重画用
   session: localStorage.getItem("gwSession") || newSessionId(),
@@ -60,7 +61,7 @@ async function loadConfig() {
     const cfg = await api("/__config");
     $("#gwTarget").placeholder = cfg.fallback_gateway;
     if (!state.target) $("#gwTarget").value = "";
-    $("#imgInfo").textContent = state.image ? state.imageName : "未选择";
+    markImageState();
     return cfg;
   } catch (err) {
     $("#statusHint").textContent = "读取本服务配置失败：" + err.message;
@@ -185,6 +186,7 @@ function loadImage(src) {
 async function setImage(dataUrl, name) {
   state.image = dataUrl;
   state.imageName = name;
+  state.imageDirty = true;         // 新图要随下一条消息发给网关
   state.lastBoxes = null;          // 换图后旧框作废
   const preview = $("#imgPreview");
   preview.src = dataUrl;
@@ -192,7 +194,24 @@ async function setImage(dataUrl, name) {
   $("#imgPlaceholder").style.display = "none";
   clearOverlay();
   await waitImage(preview);
-  $("#imgInfo").textContent = `${name} · ${preview.naturalWidth}×${preview.naturalHeight}`;
+  markImageState();
+}
+
+/* 图片状态提示：让演示现场一眼看出这张图会不会被重新发给网关。
+   网关约定（根 README §两个行为约定）：本轮带新图时会先跑一遍视觉工具做预取，
+   所以只在换图后的第一条消息附图，追问就不要再带，否则每轮都白等一次预取。 */
+function markImageState() {
+  const info = $("#imgInfo");
+  const preview = $("#imgPreview");
+  if (!state.image) {
+    info.textContent = "未选择";
+    return;
+  }
+  const size = preview.naturalWidth ? `${preview.naturalWidth}×${preview.naturalHeight}` : "";
+  const tail = state.imageDirty
+    ? "将在下一条消息发给网关（会触发一次视觉预取）"
+    : "已随会话发送（追问不重发，避免每轮重跑工具）";
+  info.textContent = [state.imageName, size, tail].filter(Boolean).join(" · ");
 }
 
 function waitImage(img) {
@@ -202,13 +221,14 @@ function waitImage(img) {
 function clearImage() {
   state.image = null;
   state.imageName = "";
+  state.imageDirty = false;
   state.lastBoxes = null;
   $("#imgPreview").removeAttribute("src");
   $("#imgPreview").style.display = "none";
   $("#imgPlaceholder").style.display = "inline-block";
-  $("#imgInfo").textContent = "未选择";
   $("#fileInput").value = "";
   clearOverlay();
+  markImageState();
 }
 
 /* ---------------------------------------------------------------- detect 叠加框 */
@@ -440,10 +460,17 @@ async function sendChat() {
 
   try {
     const payload = { session_id: state.session, message };
-    if (state.image) payload.image = state.image;
+    // 只在「换了图后的第一条消息」附图：网关对本轮新图会先跑一遍视觉工具（预取），
+    // 每轮都附图等于每轮都重跑预取，白白多等几秒。
+    const sendingImage = Boolean(state.image && state.imageDirty);
+    if (sendingImage) payload.image = state.image;
     const resp = await api("/api/chat", { method: "POST", body: payload });
     $("#chatLog").lastElementChild.remove();
     addMessage("assistant", resp.reply || "(空回复)", resp.tool_calls);
+    if (sendingImage) {              // 发送成功才算「网关那边已有这张图」
+      state.imageDirty = false;
+      markImageState();
+    }
   } catch (err) {
     $("#chatLog").lastElementChild.remove();
     addMessage("err", err.message);
@@ -471,6 +498,11 @@ function bind() {
     await setImage(drawSampleImage(), "示例图（合成，仅验证链路）");
   });
   $("#btnClearImg").addEventListener("click", clearImage);
+  $("#btnResendImage").addEventListener("click", () => {
+    if (!state.image) { markImageState(); return; }
+    state.imageDirty = true;         // 强制下一条消息重新附图（重新触发一次预取）
+    markImageState();
+  });
 
   $("#toolSelect").addEventListener("change", renderParamForm);
   $("#btnInvoke").addEventListener("click", invokeSelected);
@@ -483,8 +515,11 @@ function bind() {
   $("#btnClearChat").addEventListener("click", () => {
     state.session = newSessionId();
     localStorage.setItem("gwSession", state.session);
+    // 换了会话：网关那边的会话里没有图了，现有这张图需要重新发一次
+    state.imageDirty = Boolean(state.image);
+    markImageState();
     $("#chatLog").innerHTML = "";
-    addMessage("assistant", "已开启新会话（网关侧历史按 session_id 隔离）。");
+    addMessage("assistant", "已开启新会话（网关侧历史按 session_id 隔离）。当前图片会在下一条消息里重新发送一次。");
   });
 
   window.addEventListener("resize", () => {
