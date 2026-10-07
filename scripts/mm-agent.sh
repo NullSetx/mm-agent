@@ -12,8 +12,14 @@
 #   ./scripts/mm-agent.sh status
 #   ./scripts/mm-agent.sh restart
 #
-# 环境变量（都有默认值，见下方赋值处）：
+# 配置来源（优先级：显式环境变量 > 仓库根目录 .env > 下方默认值）：
+#   .env        统一入口，模板见 .env.example。端口 / 节点 IP / vLLM 参数 /
+#               权重路径 / VLLM_VENV 都在这儿改，不必每次在命令行前导。
+#   命令行前导   临时覆盖单个值，例：VLLM_VENV=/path ./scripts/mm-agent.sh start
+#
+# 支持的变量（都有默认值，见下方赋值处）：
 #   MM_PY         仓库 venv 的 python，默认 <repo>/.venv/bin/python
+#   MM_RUN_DIR    pid / 日志目录，默认 <repo>/.run
 #   VLLM_VENV     vLLM 所在 venv，默认 ~/vllm-venv
 #   *_PORT        各节点端口
 #   VLLM_*        vLLM 的模型路径 / 服务名 / 显存参数
@@ -21,6 +27,39 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ---- 加载仓库根目录的 .env --------------------------------------------------
+# 让端口 / VLLM_VENV / 显存参数这些和节点配置用同一份文件，不必每次命令行前导。
+# 优先级与 common/config.py 保持一致：**已存在的环境变量一律不覆盖**，
+# 所以 `VLLM_VENV=/x ./scripts/mm-agent.sh start` 这种临时覆盖仍然生效。
+# 不用 `source` 是刻意的：.env 里写错了不该把整个脚本带崩，且 source 会覆盖
+# 已有变量，与上面那条优先级相反。
+load_env_file() {
+  local f="$ROOT/.env" raw key val
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    raw="${raw%$'\r'}"                            # 容忍 CRLF
+    raw="${raw#"${raw%%[![:space:]]*}"}"          # 去行首空白
+    raw="${raw#"export "}"                        # 容忍 export KEY=...
+    if [[ "$raw" != *=* || "$raw" == '#'* ]]; then
+      continue                                    # 跳过空行与整行注释
+    fi
+    key="${raw%%=*}"; val="${raw#*=}"
+    key="${key//[[:space:]]/}"                    # 键里不该有空白，去掉
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ "$val" == '"'*'"' || "$val" == "'"*"'" ]]; then
+      val="${val:1:${#val}-2}"                    # 成对引号：引号内原样保留
+    else
+      val="${val%%[[:space:]]#*}"                 # 砍掉行尾 " # 注释"
+      val="${val%"${val##*[![:space:]]}"}"        # 去行尾空白
+    fi
+    if [[ -z "${!key:-}" ]]; then                 # 显式环境变量优先，不覆盖
+      export "$key=$val"
+    fi
+  done < "$f"
+}
+load_env_file
+
 RUN_DIR="${MM_RUN_DIR:-$ROOT/.run}"
 LOG_DIR="$RUN_DIR/logs"
 PID_DIR="$RUN_DIR/pids"
@@ -111,10 +150,16 @@ mm-agent 一键启动 / 停止 / 查看状态。
                     （Qwen3-VL 必须用自带的；仓库里那份是 Qwen2.5 专用）
                 不传则用 VLLM_MODEL_PATH，再没有就退回 weights 里的 Qwen2.5 默认
 
-环境变量（都有默认值）：
+配置来源（优先级：显式环境变量 > 仓库根目录 .env > 下面的默认值）：
+  **日常改仓库根目录的 .env 就够了**，模板见 .env.example，下面这些都能在里面设；
+  命令行前导只用于临时覆盖某个值。
+
+  脚本自己的：
   MM_PY         仓库 venv 的 python，默认 <repo>/.venv/bin/python
+  MM_RUN_DIR    pid / 日志目录，默认 <repo>/.run
   VLLM_VENV     vLLM 所在 venv，默认 ~/vllm-venv
   GATEWAY_PORT / VISION_FAST_PORT / VISION_HEAVY_PORT / KB_PORT / VLLM_PORT
+  节点与模型（由各节点自己读）：
   VLLM_MODEL_PATH / VLLM_MODEL_NAME / VLLM_CHAT_TEMPLATE
   VLLM_GPU_MEMORY_UTILIZATION / VLLM_MAX_MODEL_LEN
 EOF
@@ -128,6 +173,14 @@ die()  { printf '\033[31m[mm-agent]\033[0m %s\n' "$*" >&2; exit 1; }
 [[ -x "$PY" ]] || die "找不到仓库 venv 的 python：$PY
 先建环境：uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
 （网关和视觉节点共用这个 venv；vLLM 是另一个 venv，别混）"
+
+# 可选依赖检查。只在真要起服务时做，stop / status 不啰嗦。
+# PyMuPDF 只影响 read_document 读 PDF：缺了不挡节点启动，但很容易被无声忽略
+# （前端传了 PDF 才发现报错），所以主动提一句。
+if [[ "$CMD" == "start" || "$CMD" == "restart" ]]; then
+  "$PY" -c 'import pymupdf' >/dev/null 2>&1 || warn "没装 pymupdf —— vision-heavy 的 read_document 读不了 PDF（文本 / 图片仍可用）
+  补装：uv pip install --python .venv/bin/python -r requirements.txt"
+fi
 
 curl_ok() { curl -fsS -m 2 "$1" >/dev/null 2>&1; }
 
@@ -149,6 +202,32 @@ else
 fi
 has_node() { local n; for n in "${WANT_NODES[@]}"; do [[ "$n" == "$1" ]] && return 0; done; return 1; }
 
+# 源码 / 配置是不是比进程新。
+#
+# 这是本地开发最容易踩的坑：改了代码（或 .env）再敲 start，**已在运行的节点会被
+# 直接跳过**，于是新工具、新行为根本没生效，而界面上什么都看不出来——只会觉得
+# "怎么还是老样子"。所以发现这种情况必须明确喊出来。
+newer_than_proc() {  # $1=pid，其余 = 文件或目录（目录按 *.py 递归比 mtime）
+  local pid="$1"; shift
+  local started epoch
+  started="$(ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+  [[ -n "$started" ]] || return 1
+  epoch="$(date -d "$started" +%s 2>/dev/null)" || return 1
+  local t m
+  for t in "$@"; do
+    if [[ -d "$t" ]]; then
+      if find "$t" -name '*.py' -newermt "@$epoch" -print -quit 2>/dev/null | grep -q .; then
+        return 0
+      fi
+    elif [[ -f "$t" ]]; then
+      m="$(stat -c %Y "$t" 2>/dev/null)" || continue
+      [[ -n "$m" && "$m" -gt "$epoch" ]] && return 0
+    fi
+  done
+  return 1
+}
+
+
 # 起一个 uvicorn 进程。$1=名字 $2=端口 $3=应用 $4=mock(0/1)
 #
 # 注意这里不套子 shell：套了的话 `$!` 拿到的是那层 shell 的 pid 而不是 uvicorn 的，
@@ -159,7 +238,11 @@ spawn() {
   local pf="$PID_DIR/$name.pid"
   mkdir -p "$LOG_DIR" "$PID_DIR"
   if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
-    warn "$name 已在运行（pid $(cat "$pf")），跳过"
+    local pid; pid="$(cat "$pf")"
+    warn "$name 已在运行（pid $pid），跳过"
+    if newer_than_proc "$pid" "$ROOT/${app%%.*}" "$ROOT/common"; then
+      warn "  ↑ 但源码比这个进程新，改动没生效——先 stop 再 start（或 restart）"
+    fi
     return 0
   fi
   log "启动 $name → :$port  (日志 $LOG_DIR/$name.log)"
@@ -192,7 +275,13 @@ start_vllm() {
 设置 VLLM_MODEL_PATH，或先用 --mock 起（mock 不需要权重）"
   mkdir -p "$LOG_DIR" "$PID_DIR"
   if curl_ok "http://127.0.0.1:$VLLM_PORT/v1/models"; then
-    warn "vLLM 已在运行，跳过"; return 0
+    warn "vLLM 已在运行，跳过"
+    local vpid; vpid="$(cat "$PID_DIR/vllm.pid" 2>/dev/null || true)"
+    if [[ -n "$vpid" ]] && newer_than_proc "$vpid" "$ROOT/.env"; then
+      warn "  ↑ 但 .env 比这个 vLLM 进程新：改的窗口 / 显存参数没生效，"
+      warn "    模型仍是启动时那份（用它 --model / VLLM_* 启动时读到的值）"
+    fi
+    return 0
   fi
   log "启动 vLLM → :$VLLM_PORT"
   log "  权重    $VLLM_MODEL_PATH"

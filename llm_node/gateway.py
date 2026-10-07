@@ -49,7 +49,49 @@ _HEALTH_TIMEOUT = 3.0
 _CONNECT_TIMEOUT = 5.0
 
 #: 会话历史保留的最大消息数（含工具消息）
-MAX_HISTORY_MESSAGES = 108
+MAX_HISTORY_MESSAGES = 120
+
+#: 系统提示词 + 五个工具定义 + 输出 + 图片要占掉的 token 份额
+_LEN_RESERVE_TOKENS = 3500
+
+#: 跑着的 vLLM 自报的窗口大小，由 /api/health 的探测缓存。
+#: **不能只信 VLLM_MAX_MODEL_LEN 环境变量**：改了 .env 却没重启 vLLM 时两者会
+#: 不一致，按环境变量推导出的预算会把请求发成超长，照样被 400 拒掉（实测踩过：
+#: .env 写 102400，跑着的 vLLM 还是 10240）。
+_vllm_window: int | None = None
+
+
+def history_char_budget() -> int:
+    """历史的**字符**预算。
+
+    光有条数上限管不住上下文：一条带附件正文的用户消息可能几千字，十几条就把
+    窗口撑爆，vLLM 回 400 把整轮对话打断，而那条报错用户完全无从下手。
+    优先用**探测到的**实际窗口，探不到才退回环境变量。中文大致 1 字 ≈ 1 token，
+    所以直接拿 token 数当字符数用，偏保守。
+    """
+    override = int(os.getenv("MAX_HISTORY_CHARS", "0"))
+    if override:
+        return override
+    tokens = _vllm_window or int(os.getenv("VLLM_MAX_MODEL_LEN", "4096"))
+    return max(1500, tokens - _LEN_RESERVE_TOKENS)
+
+
+def note_vllm_window(max_model_len: Any) -> None:
+    """记下探测到的 vLLM 窗口大小。启动时和每次 /api/health 都会调。"""
+    global _vllm_window
+    try:
+        if max_model_len:
+            _vllm_window = int(max_model_len)
+    except (TypeError, ValueError):
+        pass
+
+
+#: 上下文超长时给用户看的话。vLLM 的原话（"This model's maximum context length is
+#: 10240 tokens. However, you requested 0 output tokens..."）既看不懂也不知道该干嘛。
+_CONTEXT_OVERFLOW_HINT = (
+    "这一轮的内容超出了模型窗口（对话历史 + 附件加起来太长）。"
+    "点「新建会话」开一段新的，或在 .env 里调大 VLLM_MAX_MODEL_LEN 后重启 vLLM。"
+)
 
 #: 需要 CORS。默认放开（内网演示）；公网部署时应改成具体来源，逗号分隔
 CORS_ALLOW_ORIGINS = [
@@ -86,6 +128,78 @@ def node_url(node: str) -> str:
 #: 读字（ocr）、生成（stylize）不预取：ocr 慢且多数图没文字，由 LLM 按系统
 #: 提示的决策策略自主调用（agent._system_prompt 规则 4）。
 ANALYSIS_TOOLS: tuple[str, ...] = ("detect", "classify")
+
+#: 附件正文拼进用户消息时的分隔标记。`_history_view` 靠它把正文切掉再回放，
+#: 免得前端恢复会话时用户气泡里塞满整份文档。
+DOC_BLOCK_MARK = "\n\n【附带文件："
+
+#: 读文档只认这个工具名（由 vision-heavy 节点提供）
+DOCUMENT_TOOL = "read_document"
+
+
+def split_attachment(raw: str | None) -> tuple[str, str, str]:
+    """拆分请求里的 `image` 字段 → (kind, mime, payload)。
+
+    kind：
+      "none"      没有附件
+      "image"     图片
+      "document"  其它（PDF / 文本 / 代码），交给 read_document
+
+    只看 data URI 前缀里声明的 mime：**没有前缀就当图片**（历史上裸 base64
+    的老客户端和 A 的测试台都是这个用法，不能改）；有前缀且不是 image/*
+    就按文档走。真正的类型由节点按文件头二次确认——mime 可能是错的。
+    """
+    if not raw or not raw.strip():
+        return "none", "", ""
+    text = raw.strip()
+    if not text.startswith("data:"):
+        return "image", "image/*", text
+    head, sep, payload = text.partition(",")
+    if not sep:
+        raise GatewayError(400, "附件不是合法的 data URI：缺少逗号分隔符")
+    mime = head[len("data:"):].split(";")[0].strip().lower()
+    return ("image" if mime.startswith("image/") else "document"), mime, payload
+
+
+def document_params(mime: str, payload: str, name: str = "") -> dict[str, str]:
+    """read_document 的内部参数。
+
+    键名以下划线开头 = 不暴露给模型（`agent.args_schema` 会滤掉），值只能由网关
+    注入——模型不可能知道附件的 base64。
+    """
+    return {"_data": payload, "_mime": mime, "_name": name}
+
+
+async def read_document(
+    http: httpx.AsyncClient,
+    catalog: ToolCatalog,
+    mime: str,
+    payload: str,
+    name: str = "",
+) -> str:
+    """把附件交给 read_document 工具解析，返回能直接拼进上下文的段落。
+
+    解析本身（PDF 取文本层 / 扫描页 OCR / 文本解码）在 vision-heavy 节点里，
+    网关只负责转发和把结果包成一段中文。
+    """
+    if DOCUMENT_TOOL not in {s.name for s in catalog.specs()}:
+        return "（当前没有接入能读文档的节点，附件内容无法读取。）"
+
+    try:
+        resp = await invoke_tool(
+            http, catalog, DOCUMENT_TOOL, None, document_params(mime, payload, name)
+        )
+    except GatewayError as exc:
+        # 读文档失败（超时 / 节点掉线）不该把整轮对话带崩：没有附件正文，
+        # 模型照样能回答别的问题，而且这条话本身就是给模型看的解释。
+        return f"（附件读取失败：{exc.message}）"
+    if not resp.ok:
+        return f"（附件读取失败：{resp.error}）"
+
+    out = resp.result or {}
+    note = str(out.get("note") or "").strip()
+    head = f"【附带文件：{name or mime or '未命名'}】" + (f"（{note}）" if note else "")
+    return f"{head}\n{out.get('text') or '（没有读出内容）'}"
 
 
 async def _prefetch_observations(
@@ -262,10 +376,11 @@ def _history_view(history: list[Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in history:
         if isinstance(m, HumanMessage):
-            out.append({
-                "role": "user",
-                "text": m.content if isinstance(m.content, str) else "",
-            })
+            text = m.content if isinstance(m.content, str) else ""
+            # 附件正文是拼在用户消息后面的，回放时切掉——不然用户气泡里会塞满
+            # 整份文档，而用户其实只打了一句话。正文该给模型看，不该给界面看。
+            text = text.split(DOC_BLOCK_MARK)[0]
+            out.append({"role": "user", "text": text})
         elif isinstance(m, AIMessage):
             item: dict[str, Any] = {
                 "role": "assistant",
@@ -314,6 +429,7 @@ def _sse(payload: dict[str, Any]) -> str:
 async def _stream_events(
     http: httpx.AsyncClient,
     catalog: ToolCatalog,
+    store: SessionStore,
     session: Any,
     req: ChatRequest,
 ) -> AsyncIterator[str]:
@@ -325,8 +441,16 @@ async def _stream_events(
     注意：异常发生在响应头已经发出之后，没法再改 HTTP 状态码（504/502），
     所以流里的失败一律以 `error` 事件表达——这是 SSE 的固有限制。
     """
+    #: 本轮附件的真实内容。值只有网关知道，所以模型无论传什么（下划线参数本来
+    #: 也不会暴露给它）都用这里覆盖一遍——否则模型瞎猜的 base64 会把工具打挂，
+    #: 然后它就照着报错回答，白白无视上下文里的正文。
+    doc_params: dict[str, str] = {}
+
     def invoke(tool: str, image: str | None, params: dict[str, Any]) -> Any:
-        return invoke_tool(http, catalog, tool, image, params)
+        call_params = dict(params or {})
+        if tool == DOCUMENT_TOOL and doc_params:
+            call_params.update(doc_params)
+        return invoke_tool(http, catalog, tool, image, call_params)
 
     if mock_enabled():
         reply, records = await agent.mock_chat(req.message, session.image, catalog.specs())
@@ -336,13 +460,25 @@ async def _stream_events(
         yield _sse({"type": "done", "reply": reply, "tool_calls": records})
         return
 
+    # 附件分流：图片走预取 + 多模态；PDF / 文本走 read_document 读成正文拼进消息。
+    # 文档**不能**进 image_url（vLLM 会当成图片去解，直接 400），也不能当
+    # tool_image——detect / ocr 那些工具要的是图，拿到 PDF 只会报错。
+    kind, mime, payload = split_attachment(req.image)
+    turn_message = req.message
+    model_image: str | None = None
+    if kind == "document":
+        doc_params.update(document_params(mime, payload))
+        turn_message = f"{req.message}\n\n{await read_document(http, catalog, mime, payload)}"
+    elif kind == "image":
+        model_image = req.image
+
     # 只在**这一轮上传了新图**时预取。会话图会跨轮留存，若按 session.image
     # 判断，用户之后随便说句"谢谢你"都会把 detect/classify 重跑一遍，
     # 而且观察被重新注入会把模型带偏成继续描述图片。
     # 追问轮（本轮没传新图但会话有图）给模型一句提示：图片工具仍可用
     # （工具自动取会话图），否则小模型会误以为"没图"而让用户重传。
     observations, prefetch = None, []
-    if req.image and session.image:
+    if model_image and session.image:
         observations, prefetch = await _prefetch_observations(http, catalog, session.image)
     elif session.image:
         observations = _FOLLOWUP_IMAGE_HINT
@@ -350,11 +486,20 @@ async def _stream_events(
     for r in prefetch:
         yield _sse({"type": "tool", **r})
 
+    # **发之前先裁一遍**。只在轮末裁是不够的：库里存的历史可能是上一次配置留下的
+    # （比如旧的 120 条上限），这一轮照样会带着超长历史发出去、照样被 vLLM 400 拒。
+    # 把本轮消息一起算进预算再摘掉它——那条由 stream_chat 自己拼。
+    history_in = agent.trim_history(
+        [*session.history, HumanMessage(content=turn_message)],
+        MAX_HISTORY_MESSAGES,
+        history_char_budget(),
+    )[:-1]
+
     try:
         async for ev in agent.stream_chat(
-            session.history,
-            req.message,
-            req.image,  # 只在本轮附图；追问轮靠历史里那张图
+            history_in,
+            turn_message,
+            model_image,  # 只在本轮附图；追问轮靠会话里那张图
             agent.build_tools(catalog.specs(), invoke),
             observations=observations,
             tool_image=session.image,  # 追问轮模型仍可能调工具，得给着图
@@ -363,11 +508,17 @@ async def _stream_events(
                 session.history = agent.trim_history(
                     [
                         *session.history,
-                        HumanMessage(content=req.message),
+                        # 存的是带附件正文的那份：正文得跟着历史留下来，
+                        # 否则追问「第 3 页说了什么」时内容已经不在上下文里了
+                        HumanMessage(content=turn_message),
                         *ev["messages"],
                     ],
                     MAX_HISTORY_MESSAGES,
+                    history_char_budget(),
                 )
+                # 必须在这里落盘：本函数是响应体生成器，端点函数在 StreamingResponse
+                # 返回时就已退出，轮不到它做保存——漏了这步，每轮都会从空会话开始。
+                store.save(req.session_id, session)
                 yield _sse({
                     "type": "done",
                     "reply": ev["reply"],
@@ -395,6 +546,13 @@ async def _stream_events(
             "type": "error",
             "message": f"LLM 服务不可达（{llm.vllm_base_url()}），请先启动 vLLM：{exc}",
         })
+    except APIStatusError as exc:
+        # 400 基本都是上下文超长（vLLM 原话："maximum context length is N tokens"）。
+        # 那串报错用户看不懂也不知道该干嘛，换成人话。
+        if exc.status_code == 400 and "context length" in str(exc).lower():
+            yield _sse({"type": "error", "message": _CONTEXT_OVERFLOW_HINT})
+            return
+        yield _sse({"type": "error", "message": f"vLLM 返回 {exc.status_code}：{exc.message}"})
     except Exception as exc:  # noqa: BLE001
         # 兜底：响应头早已发出，异常若直接抛出去会掐断连接，浏览器只看到一句
         # 无从下手的 "Load failed"。转成 error 事件，前端能显示原因，日志留全栈。
@@ -417,6 +575,11 @@ def build_app() -> FastAPI:
             except DuplicateToolError as exc:
                 # 启动遇重名不阻断：网关照常起，/api/health 能用，重定义留给人工
                 logging.getLogger("llm_node.gateway").error("启动工具发现失败：%s", exc)
+
+            # 顺手探一次 vLLM：历史字符预算要按它**实际**的窗口算，不能只信 .env
+            # （改了 .env 却没重启 vLLM 时两者会不一致，预算会算大、照样 400）。
+            # probe 自己吞异常，所以 vLLM 没起也不挡网关启动。
+            note_vllm_window((await llm.probe(app.state.http)).get("max_model_len"))
             yield
         finally:
             await app.state.http.aclose()
@@ -470,6 +633,7 @@ def build_app() -> FastAPI:
                 }
 
         vllm = await llm.probe(http)
+        note_vllm_window(vllm.get("max_model_len"))
         catalog: ToolCatalog = request.app.state.catalog
         all_ok = all(n["ok"] for n in nodes.values()) and vllm["ok"]
         return {
@@ -545,11 +709,20 @@ def build_app() -> FastAPI:
         catalog: ToolCatalog = request.app.state.catalog
         session = request.app.state.sessions.get(req.session_id)
         if req.image:
-            session.image = req.image
+            # session.image 是留给"当前图片"的——工具会拿它当输入图。
+            # 文档不往里放：PDF 给 detect / ocr 只会报"不是有效图片"，而且一份
+            # 文档的 base64 存进库里也纯属浪费；它的正文当轮已拼进消息并随历史留存。
+            try:
+                attach_kind = split_attachment(req.image)[0]
+            except GatewayError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+            session.image = req.image if attach_kind == "image" else None
 
         if req.stream:
             return StreamingResponse(
-                _stream_events(http, catalog, session, req),
+                _stream_events(
+                    http, catalog, request.app.state.sessions, session, req
+                ),
                 media_type="text/event-stream",
                 headers=SSE_HEADERS,
             )
@@ -564,10 +737,21 @@ def build_app() -> FastAPI:
                 history_len=len(session.history), history_max=MAX_HISTORY_MESSAGES,
             )
 
+        # 附件分流，与流式路径同一套（理由见 _stream_events）
+        kind, mime, payload = split_attachment(req.image)
+        turn_message = req.message
+        model_image: str | None = None
+        doc_params: dict[str, str] = {}
+        if kind == "document":
+            doc_params.update(document_params(mime, payload))
+            turn_message = f"{req.message}\n\n{await read_document(http, catalog, mime, payload)}"
+        elif kind == "image":
+            model_image = req.image
+
         # 只在**这一轮上传了新图**时预取（与流式路径同一判断，理由见 _stream_events）；
         # 追问轮给模型一句提示：会话图仍在，图片工具可直接用（见 _FOLLOWUP_IMAGE_HINT）
         observations, prefetch_records = None, []
-        if req.image and session.image:
+        if model_image and session.image:
             observations, prefetch_records = await _prefetch_observations(
                 http, catalog, session.image
             )
@@ -575,11 +759,21 @@ def build_app() -> FastAPI:
             observations = _FOLLOWUP_IMAGE_HINT
 
         def invoke(tool: str, image: str | None, params: dict[str, Any]) -> Any:
-            return invoke_tool(http, catalog, tool, image, params)
+            call_params = dict(params or {})
+            if tool == DOCUMENT_TOOL and doc_params:
+                call_params.update(doc_params)
+            return invoke_tool(http, catalog, tool, image, call_params)
+
+        # 发之前先裁一遍，理由见 _stream_events（只在轮末裁挡不住库里已有的超长历史）
+        history_in = agent.trim_history(
+            [*session.history, HumanMessage(content=turn_message)],
+            MAX_HISTORY_MESSAGES,
+            history_char_budget(),
+        )[:-1]
 
         try:
             reply, records, new_msgs = await agent.run_chat(
-                session.history, req.message, req.image,
+                history_in, turn_message, model_image,
                 agent.build_tools(specs, invoke),
                 observations=observations,
                 tool_image=session.image,
@@ -598,21 +792,25 @@ def build_app() -> FastAPI:
                 detail=f"LLM 服务不可达（{llm.vllm_base_url()}），请先启动 vLLM：{exc}",
             ) from exc
         except APIStatusError as exc:
-            # vLLM 有响应但拒绝了请求：404 模型名对不上 / 400 参数或图片超长 / 429 过载
+            # vLLM 有响应但拒绝了请求：404 模型名对不上 / 400 参数或上下文超长 / 429 过载
+            if exc.status_code == 400 and "context length" in str(exc).lower():
+                raise HTTPException(status_code=502, detail=_CONTEXT_OVERFLOW_HINT) from exc
             raise HTTPException(
                 status_code=502,
                 detail=f"vLLM 返回 {exc.status_code}：{exc.message}"
                        "（404 时先核对 VLLM_MODEL_NAME 是否与 /v1/models 里的 id 一致）",
             ) from exc
 
-        # 历史拼装：用户消息也进历史（P0，只存文本），并按调用对对齐裁剪（P1）
+        # 历史拼装：用户消息也进历史（P0，只存文本），并按调用对对齐裁剪（P1）。
+        # 存的是带附件正文的 turn_message——正文得跟着历史留下来，追问才接得上。
         session.history = agent.trim_history(
             [
                 *session.history,
-                HumanMessage(content=req.message),
+                HumanMessage(content=turn_message),
                 *new_msgs,
             ],
             MAX_HISTORY_MESSAGES,
+            history_char_budget(),
         )
         request.app.state.sessions.save(req.session_id, session)
         return ChatResponse(

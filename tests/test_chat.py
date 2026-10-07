@@ -8,12 +8,14 @@ import cv2
 import numpy as np
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from llm_node import gateway as gw, llm
+from llm_node import agent as agent_mod, gateway as gw, llm
+from llm_node.sessions import Session
 from tests.conftest import make_toy_node
 
 FAST = gw.node_url("vision-fast")
+HEAVY = gw.node_url("vision-heavy")
 
 
 class FakeAgentModel(FakeMessagesListChatModel):
@@ -268,3 +270,191 @@ async def test_chat_stream_sse_frames(gateway, router, monkeypatch):
     done = events[-1]
     assert "mock" in done["reply"]
     assert done["tool_calls"] == []
+
+
+@pytest.mark.anyio
+async def test_chat_stream_persists_session(gateway, router, monkeypatch):
+    """stream=true 也必须把会话落盘，否则多轮就是每轮空会话。
+
+    回归保护：流式分支在 _stream_events 里更新 session.history，但端点函数随
+    `return StreamingResponse(...)` 就退出了，保存只能由响应体生成器自己做。
+    漏了那步不会报错——SSE 的 done 事件照样带着 history_len，前端看着很正常，
+    只有回到数据库才发现会话根本没写。
+    """
+    router[FAST] = make_toy_node("vision-fast", [
+        {"name": "echo", "description": "回声", "needs_image": False,
+         "fn": lambda: {"pong": True}},
+    ])
+    await gateway.post("/api/tools/refresh")
+
+    monkeypatch.setattr(
+        llm, "build_chat_model",
+        lambda **kw: FakeAgentModel(responses=[AIMessage(content="回答完毕")]),
+    )
+
+    store = router["_app"].state.sessions
+    resp = await gateway.post(
+        "/api/chat",
+        json={"session_id": "s7", "message": "测试一下", "stream": True},
+    )
+    assert resp.status_code == 200
+
+    # SessionStore 没有内存缓存，get() 就是查 SQLite —— 读得到即已落盘
+    session = store.get("s7")
+    assert [m.content for m in session.history] == ["测试一下", "回答完毕"]
+
+    # 第二轮若从空会话开始，落盘后只会有 2 条；有 4 条才说明上一轮真的被读回来了
+    resp = await gateway.post(
+        "/api/chat",
+        json={"session_id": "s7", "message": "再问一次", "stream": True},
+    )
+    assert resp.status_code == 200
+    session = store.get("s7")
+    assert [m.content for m in session.history] == [
+        "测试一下", "回答完毕", "再问一次", "回答完毕",
+    ]
+
+
+# ---------------------------------------------------------------- 附件分流
+
+def test_split_attachment():
+    """只看 data URI 前缀声明的 mime；无前缀沿用老语义当图片（A 的测试台和
+    历史客户端发的都是裸 base64，这条不能改）。"""
+    assert gw.split_attachment(None) == ("none", "", "")
+    assert gw.split_attachment("   ") == ("none", "", "")
+
+    assert gw.split_attachment("AAAA")[0] == "image"
+    assert gw.split_attachment("data:image/png;base64,AAAA")[0] == "image"
+
+    kind, mime, payload = gw.split_attachment("data:application/pdf;base64,JVBERi0=")
+    assert (kind, mime, payload) == ("document", "application/pdf", "JVBERi0=")
+    assert gw.split_attachment("data:text/x-python;base64,ZA==")[0] == "document"
+
+
+def test_split_attachment_rejects_broken_data_uri():
+    with pytest.raises(gw.GatewayError):
+        gw.split_attachment("data:application/pdf;base64")
+
+
+@pytest.mark.anyio
+async def test_pdf_attachment_goes_through_read_document(gateway, router, monkeypatch):
+    """PDF 走文档通道：交给 read_document 读成正文拼进消息。
+
+    两个关键点：正文要随历史留存（否则追问「第 3 页说了什么」时内容已经不在
+    上下文里），且**不能**存进 session.image（那是"当前图片"，工具会拿它当输入图，
+    给 detect / ocr 一份 PDF 只会报"不是有效图片"）。
+    """
+    seen: list[dict] = []
+
+    def fake_read_document(_data="", _mime="", _name=""):
+        seen.append({"data": _data, "mime": _mime, "name": _name})
+        return {"kind": "pdf", "text": "--- 第 1 页 ---\n文档正文在这里", "note": "共 1 页"}
+
+    router[HEAVY] = make_toy_node("vision-heavy", [
+        {"name": "read_document", "description": "读文件", "needs_image": False,
+         "params": {"_data": "", "_mime": "", "_name": ""}, "fn": fake_read_document},
+    ])
+    await gateway.post("/api/tools/refresh")
+    monkeypatch.setattr(
+        llm, "build_chat_model",
+        lambda **kw: FakeAgentModel(responses=[AIMessage(content="读到了")]),
+    )
+
+    payload = base64.b64encode(b"%PDF-1.4 fake").decode()
+    resp = await gateway.post("/api/chat", json={
+        "session_id": "d1", "message": "这份 PDF 讲了什么？",
+        "image": f"data:application/pdf;base64,{payload}",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["reply"] == "读到了"
+
+    assert seen and seen[0]["data"] == payload
+    assert seen[0]["mime"] == "application/pdf"
+
+    session = router["_app"].state.sessions.get("d1")
+    human = [m for m in session.history if m.type == "human"][0]
+    assert "文档正文在这里" in human.content          # 正文进了历史
+    assert "共 1 页" in human.content                 # 附注也带上
+    assert session.image is None                     # 没被当成"当前图片"
+
+
+@pytest.mark.anyio
+async def test_image_attachment_keeps_old_path(gateway, router, monkeypatch):
+    """图片仍走老路：不经过 read_document，session.image 存下来供工具用。"""
+    seen: list[dict] = []
+
+    def fake_read_document(_data="", _mime="", _name=""):
+        seen.append({"data": _data})
+        return {"kind": "text", "text": "", "note": ""}
+
+    router[HEAVY] = make_toy_node("vision-heavy", [
+        {"name": "read_document", "description": "读文件", "needs_image": False,
+         "params": {"_data": "", "_mime": "", "_name": ""}, "fn": fake_read_document},
+    ])
+    await gateway.post("/api/tools/refresh")
+    monkeypatch.setattr(
+        llm, "build_chat_model",
+        lambda **kw: FakeAgentModel(responses=[AIMessage(content="看到了")]),
+    )
+
+    png = f"data:image/png;base64,{_tiny_png_base64()}"
+    resp = await gateway.post("/api/chat", json={
+        "session_id": "d2", "message": "这是什么？", "image": png,
+    })
+    assert resp.status_code == 200
+
+    assert seen == []                                # 文档通道没被碰
+    session = router["_app"].state.sessions.get("d2")
+    assert session.image == png
+    human = [m for m in session.history if m.type == "human"][0]
+    assert human.content == "这是什么？"               # 图片不往消息里塞正文
+
+
+# ---------------------------------------------------------------- 上下文预算
+
+_seen_inputs: list[list] = []
+
+
+class RecordingAgentModel(FakeAgentModel):
+    """记录模型实际收到的消息，用来断言"发之前裁过"。"""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        _seen_inputs.append(list(messages))
+        return super()._generate(messages, stop, run_manager, **kwargs)
+
+
+@pytest.mark.anyio
+async def test_oversized_history_is_trimmed_before_sending(gateway, router, monkeypatch):
+    """库里已经躺着的超长历史，也要在**发之前**裁掉。
+
+    只在轮末裁挡不住这种情况：那批历史是上一次配置留下的，这一轮会原样发出去、
+    被 vLLM 400 拒掉——实测就是这么炸的（报错还是"maximum context length is
+    10240 tokens"这种用户完全无从下手的话）。
+    """
+    store = router["_app"].state.sessions
+    store.save("big", Session(history=[HumanMessage(content="X" * 5000) for _ in range(4)]))
+
+    # 把预算钉死，免得测试结果随 .env / 探到的 vLLM 窗口变化
+    monkeypatch.setattr(gw, "history_char_budget", lambda: 6000)
+
+    _seen_inputs.clear()
+    monkeypatch.setattr(
+        llm, "build_chat_model",
+        lambda **kw: RecordingAgentModel(responses=[AIMessage(content="好")]),
+    )
+
+    resp = await gateway.post("/api/chat", json={"session_id": "big", "message": "接着说"})
+    assert resp.status_code == 200
+    assert resp.json()["reply"] == "好"
+
+    sent = _seen_inputs[-1]
+    total = sum(agent_mod._msg_chars(m) for m in sent)
+    assert total <= 6000, f"发出去了 {total} 字符，超过预算"
+    # 最新那条是用户刚说的话，绝不能丢
+    assert "接着说" in str(sent[-1].content)
+
+    # 轮末也要裁：落库的历史总量回到预算内，下一轮不至于又超
+    persisted = store.get("big").history
+    kept = sum(agent_mod._msg_chars(m) for m in persisted)
+    assert kept <= 6000
+    assert kept < 20000, "轮末没裁，库里还是原始的超长历史"
