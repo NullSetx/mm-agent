@@ -58,6 +58,11 @@ openai
 # transformers 同样内置支持，换 OCR_MODEL_ID 即可，无需额外依赖。
 transformers==5.17.0
 
+# read_document：读 PDF 用。PyMuPDF 纯 CPU、无系统依赖（不像 pdf2image 要 poppler）。
+# 电子版 PDF 直接取文本层，只有扫描页才渲染成图送给 OCR，所以它是可选加速而非必需——
+# 没装时 read_document 会明确提示装它，不挡节点启动。
+pymupdf>=1.24
+
 # ── kb_node（A · 知识库，16GB 节点）───────────────────────────
 # 方案见 docs/知识库方案.md：embedding 走 OpenAI 兼容 API（零额外依赖），
 # 向量库用 chromadb（A 的机器装；B/C 不装不影响各自节点，kb_node 懒加载，

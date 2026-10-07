@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 from pathlib import Path
 
@@ -24,7 +25,7 @@ import numpy as np
 from common.config import mock_enabled
 from common.node import build_app
 from common.registry import tool
-from vision_heavy import models
+from vision_heavy import documents, models
 
 log = logging.getLogger("vision_heavy.server")
 
@@ -234,6 +235,65 @@ def stylize(image: np.ndarray, style: str = "", size: int = 512, iters: int = 10
     return {"image": _encode_jpeg(result), "style": style_path.stem, **info}
 
 
+# ---------------------------------------------------------------- 工具：read_document
+
+
+def _decode_base64(text: str) -> bytes:
+    """base64 → bytes。容忍 data: 前缀 / 换行 / 缺 padding，与 common.node 同款处理。"""
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("data 为空：没有附带的文件内容")
+    if s.startswith("data:"):
+        _, sep, payload = s.partition(",")
+        if not sep:
+            raise ValueError("data URI 缺少逗号分隔符")
+        s = payload
+    s = "".join(s.split())
+    s += "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(s, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"data 不是合法的 base64：{exc}") from exc
+
+
+def _ocr_page(image: np.ndarray) -> dict:
+    """扫描页 / 图片的回调：走本节点自己的 OCR（懒加载 + 空闲释放由 ocr_model 管）。"""
+    return _run_ocr(models.ocr_model.get(), image)
+
+
+@tool(
+    name="read_document",
+    description=(
+        "读取本轮**附带的文件**并返回它的文字内容，支持 PDF、文本 / 代码文件、图片。"
+        "PDF 优先取文本层，只有扫描页才走 OCR。"
+        "附件在提问那一轮已经自动读好并放进上下文了，**通常不需要调用本工具**，"
+        "直接依据上下文里的「附带文件」段落回答即可。"
+    ),
+    needs_image=False,
+    # 参数名以下划线开头 = 内部参数，不会暴露给模型（见 agent.args_schema），
+    # 值由网关从会话附件里注入。声明出来只是因为 registry 只透传声明过的键。
+    params={"_data": "", "_mime": "", "_name": ""},
+)
+def read_document(_data: str = "", _mime: str = "", _name: str = "") -> dict:
+    if mock_enabled():
+        return {
+            "kind": "mock",
+            "name": _name or "mock.txt",
+            "mime": _mime or "",
+            "text": "[mock] 这里本该是附带文件的正文。",
+            "pages": 1,
+            "pages_total": 1,
+            "scanned_pages": 0,
+            "truncated": False,
+            "note": "",
+        }
+
+    out = documents.read_document(_decode_base64(_data), _ocr_page)
+    out["name"] = _name or ""
+    out["mime"] = _mime or ""
+    return out
+
+
 # ---------------------------------------------------------------- 应用
 
 
@@ -243,6 +303,7 @@ def _health_detail() -> dict:
     detail["mock"] = mock_enabled()
     detail["styles"] = styles
     detail["style_dir"] = str(STYLE_DIR)
+    detail["pymupdf"] = documents.pymupdf_available()
     return detail
 
 
