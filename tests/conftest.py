@@ -7,7 +7,20 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable
+
+# 测试必须与本机 .env 隔离：.env 里是真实联调地址（192.168.x.x），而测试的
+# 假节点全部注册在 127.0.0.1。common/config.py 启动时 load_dotenv(override=False)
+# 不会覆盖显式环境变量，所以在这里强制置回测试默认值——本块必须先于任何项目 import。
+for _k, _v in {
+    "LLM_HOST": "127.0.0.1",
+    "VISION_FAST_HOST": "127.0.0.1",
+    "VISION_HEAVY_HOST": "127.0.0.1",
+    "KB_HOST": "127.0.0.1",
+    "NODE_MOCK": "",
+}.items():
+    os.environ[_k] = _v
 
 import httpx
 import pytest

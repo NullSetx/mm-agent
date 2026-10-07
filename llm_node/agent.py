@@ -200,6 +200,13 @@ def args_schema(spec: ToolSpec) -> type[BaseModel]:
     return model
 
 
+#: 无图时调用图片工具的统一拦截文案（给模型看的反馈，测试也引用）
+_NO_IMAGE_HINT = (
+    "当前没有可用图片（本轮没传图、会话里也没有图）。"
+    "请正常回复并引导用户上传图片，不要再次调用本工具。"
+)
+
+
 def build_tool(spec: ToolSpec, invoke: InvokeFn) -> StructuredTool:
     """把一个 ToolSpec 包成 LangChain 工具。
 
@@ -209,6 +216,18 @@ def build_tool(spec: ToolSpec, invoke: InvokeFn) -> StructuredTool:
 
     async def _run(**kwargs: Any) -> str:
         image = _current_image.get() if spec.needs_image else None
+        if spec.needs_image and not image:
+            # 小模型偶尔会在没有图片的闲聊轮凭空调用图片工具（连道歉后还会再犯）。
+            # 在这里拦截不出网：给模型一句可读反馈让它去引导用户传图，
+            # 也省掉一次必然失败的下游调用。
+            err = _NO_IMAGE_HINT
+            records = _current_records.get()
+            if records is not None:
+                records.append(
+                    {"tool": spec.name, "ok": False, "result": None, "error": err}
+                )
+            return f"工具未执行：{err}"
+
         try:
             resp = await invoke(spec.name, image, kwargs)
         except Exception as exc:  # noqa: BLE001 - 工具失败要反馈给 LLM 而不是炸掉对话
@@ -287,13 +306,16 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
         "也不要为了同一份东西再去调一次工具；\n"
         "5. 视觉工具自己判断：观察里没有文字、而问题需要读图中文字（写了什么、"
         "牌子、号码），调 ocr；用户要求把图片转成某种风格（动漫、素描），调 stylize；"
-        "观察已经覆盖了问题就直接回答，不必重复调用；\n"
+        "观察已经覆盖了问题就直接回答，不必重复调用。"
+        "**本轮没传图、且会话里也没有图时，禁止调用 ocr / stylize 等需要图片的"
+        "工具**（调了必然失败，该引导用户传图）；\n"
         "6. 用户的问题可能带有错误预设（例如问“有几个人”但观察显示没有人）："
         "一切以观察为准，观察里说没有就明确说没有；\n"
         "7. 图片类工具（如风格迁移）的生成结果已直接展示给用户，你只需一句话"
         "说明生成了什么，不要试图描述图片文件内容；\n"
         "8. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
-        "9. 用中文简洁回答；工具失败时如实告诉用户原因；寒暄闲聊不必调工具。"
+        "9. 用中文简洁回答；工具失败时如实告诉用户原因。"
+        "**闲聊、寒暄、与图片和知识都无关的消息不要调用任何工具**。"
     )
 
 
