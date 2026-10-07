@@ -51,6 +51,22 @@ def test_args_schema_empty_params():
     assert schema.model_json_schema()["properties"] == {}
 
 
+def test_args_schema_hides_internal_params():
+    """下划线开头的参数是内部参数，不能进 LLM 的 schema。
+
+    它们是网关注入的（如 read_document 的文件内容），模型既拿不到也不该编。
+    实测 4B 会照着自己臆造的值去调、拿到报错后**照着报错回答**，把已经放进
+    上下文的正文全无视掉——所以这层过滤是必需的，不是洁癖。
+    """
+    spec = ToolSpec(
+        name="read_document", description="d",
+        params={"_data": "", "_mime": "", "_name": "", "topk": 3},
+    )
+    fields = agent.args_schema(spec).model_fields
+    assert set(fields) == {"topk"}
+    assert agent.args_schema(spec).model_json_schema()["properties"].keys() == {"topk"}
+
+
 # ---------------------------------------------------------------- 工具兜底
 
 @pytest.mark.anyio
@@ -147,6 +163,54 @@ def test_trim_history_keeps_pairs_intact():
 def test_trim_history_short_passthrough():
     msgs = [HumanMessage(content="a"), AIMessage(content="b")]
     assert agent.trim_history(msgs, 12) == msgs
+
+
+def test_trim_history_by_char_budget():
+    """条数没超但字符超了也要裁——一条带附件正文的消息就能撑爆窗口。
+
+    这是实测踩到的：MAX_HISTORY_MESSAGES 开到 120 也没用，14 条消息里夹两个
+    文档块（单条 6000 字）就把 10240 token 的窗口顶穿，vLLM 回 400 打断对话。
+    """
+    msgs = [
+        HumanMessage(content="问一"),
+        AIMessage(content="答一"),
+        HumanMessage(content="X" * 3000),   # 像带附件正文的那条
+    ]
+    out = agent.trim_history(msgs, max_messages=99, max_chars=500)
+    assert len(out) == 1
+    assert out[0].content == "X" * 3000     # 最新的那条必须留下
+
+
+def test_trim_history_keeps_last_even_if_oversized():
+    """单条就超预算时也得留着最后一条：那是用户刚说的话，丢了模型只会答非所问。"""
+    msgs = [AIMessage(content="旧的"), HumanMessage(content="X" * 5000)]
+    out = agent.trim_history(msgs, max_messages=99, max_chars=100)
+    assert len(out) == 1
+    assert out[0].content == "X" * 5000
+
+
+def test_trim_history_char_budget_does_not_override_count_limit():
+    """预算宽裕时行为不变：仍按条数上限裁。"""
+    msgs = [HumanMessage(content=f"第{i}轮") for i in range(10)]
+    out = agent.trim_history(msgs, max_messages=3, max_chars=10**6)
+    assert len(out) == 3
+    assert out[-1].content == "第9轮"
+
+
+def test_trim_history_char_budget_counts_multimodal_parts():
+    """多模态消息只按 parts 里的文本算字符，不能把图片 base64 也算进去——
+    算了的话每条带图消息都会把预算吃光，历史瞬间被清空。"""
+    big_image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "z" * 9999}}
+    msgs = [
+        HumanMessage(content="短"),                       # 1
+        HumanMessage(content="中" * 500),                 # 500
+        HumanMessage(content=[big_image, {"type": "text", "text": "Y" * 800}]),  # 只算 800
+    ]
+    # 预算 1300：正确实现能装下后两条（500+800）；若把 base64 也算进去，
+    # 光是最后一条就 10799 > 1300，结果会只剩 1 条。
+    out = agent.trim_history(msgs, max_messages=99, max_chars=1300)
+    assert len(out) == 2
+    assert out[-1].content[1]["text"] == "Y" * 800
 
 
 # ---------------------------------------------------------------- mock 对话
@@ -253,3 +317,61 @@ async def test_run_chat_tool_error_feeds_back_to_llm(gateway, router):
     assert reply == "工具挂了，抱歉"
     assert records[0]["ok"] is False
     assert "GatewayError" in records[0]["error"]
+
+
+# ---------------------------------------------------------------- 系统提示词
+
+def test_system_prompt_covers_observed_failures():
+    """规则里这几条都是照着**实测失败**加的，改提示词时别顺手删掉。"""
+    class _Tool:
+        def __init__(self, name, description):
+            self.name, self.description = name, description
+
+    prompt = agent._system_prompt([
+        _Tool("kb_search", "检索百科知识库。用户问百科知识时调用。"),
+        _Tool("ocr", "识别图片中的文字。"),
+    ])
+
+    # 问「你的知识库到什么时候」时它编了个「2024年12月」——必须明确禁止编日期
+    assert "我的知识更新到某年某月" in prompt
+    # 追问时它说过「无法调用工具」——必须明确禁止这句
+    assert "我无法调用工具" in prompt
+    # 禁止编造工具结果（原提示词就有，重构时别丢）
+    assert "禁止编造工具结果" in prompt
+    # 不交代来历，模型不认「附带文件」那段，还要再调一次 read_document
+    assert "【附带文件：" in prompt
+    # 工具是动态列的：写死工具名会在节点下线后失真
+    assert "kb_search" in prompt and "detect" not in prompt
+    # 视觉工具的自主决策策略不能被挤掉
+    assert "ocr" in prompt and "stylize" in prompt
+
+
+def test_no_date_anchor_in_system_prompt():
+    """**不要在提示词里写今天的日期**。试过，反而更糟：4B 直接把它当成自己的
+    知识截止日吐了出来（"我的知识库更新至2026年10月7日"），比原来那个
+    "2024年12月"看起来还权威。"""
+    import re
+
+    class _Tool:
+        def __init__(self, name, description):
+            self.name, self.description = name, description
+
+    prompt = agent._system_prompt([_Tool("kb_search", "检索。")])
+    assert not re.search(r"20\d{2}[-年]\d{1,2}", prompt)
+
+
+def test_kb_triggers_survive_sentence_one_truncation():
+    """kb_search 的触发条件必须落在描述的**第一句**里。
+
+    系统提示词列工具时只取 `.split("。")[0]`；触发词原来写在第二句，等于没进
+    提示词——实测 4B 就是这么漏掉"关于你自己的问题也要先检索"的。"""
+    from kb_node.server import _KB_DESCRIPTION_BASE
+
+    class _Tool:
+        def __init__(self, name, description):
+            self.name, self.description = name, description
+
+    prompt = agent._system_prompt([_Tool("kb_search", _KB_DESCRIPTION_BASE)])
+    assert "关于你自己" in prompt
+    assert "时间敏感" in prompt
+    assert "核实真假" in prompt

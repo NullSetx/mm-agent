@@ -57,12 +57,34 @@ def model_name() -> str:
 
 
 def build_chat_model(**overrides: Any) -> ChatOpenAI:
-    """构造指向 vLLM 的 ChatOpenAI。api_key 对本地 vLLM 是占位符。"""
+    """构造指向 vLLM 的 ChatOpenAI。api_key 对本地 vLLM 是占位符。
+
+    **temperature 千万别设 0**。贪心解码下，只要上下文里出现过一段重复内容，
+    模型"最可能的下一个 token"就是继续复读它——自我强化，一旦开始停不下来。
+    实测：连着几轮「喵」，它把同一句冷笑话复读了十几遍、每次只改一两个字；
+    而且每轮回复都会进历史，等于每轮给自己加码。权重自带的 generation_config
+    是 temperature=0.7 / top_p=0.8 / top_k=20，本来就不是给贪心用的。
+
+    默认取模型作者自己的配置 **0.7 / top_p 0.8**，并叠一个 presence_penalty 压制
+    逐字复读。这几个数是实测调出来的，别凭感觉降：
+
+        配置                     相邻两轮回复的相似度（连发 6 轮「喵」）
+        temperature=0.0          0.24 → 0.32 → 0.44 → 0.86 → 0.96   ← 收敛成复读
+        temperature=0.4          0.24 → 0.32 → 0.42 → 0.86 → 0.96   ← 一模一样，白改
+        temperature=0.7 + 惩罚    0.20 → 0.36 → 0.28 → 0.31 → 0.27   ← 一直是新内容
+
+    也就是说 **0.4 这种"折中"毫无用处**：复读的主因不是随机性，而是上下文里已经
+    堆了几轮相同的回复，续写它就是概率最高的事；只有把温度提到模型本来该用的
+    0.7 才压得住。代价是 4B 的工具调用会比贪心时飘一点，所以别再加高。
+    """
     kwargs: dict[str, Any] = dict(
         base_url=vllm_base_url() + "/v1",
         api_key="EMPTY",
         model=model_name(),
-        temperature=0.0,
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
+        top_p=float(os.getenv("LLM_TOP_P", "0.8")),
+        #: vLLM 的 OpenAI 接口支持，直接压制逐字复读
+        presence_penalty=float(os.getenv("LLM_PRESENCE_PENALTY", "0.8")),
         timeout=CHAT_TIMEOUT,
         max_retries=0,  # 快速失败上抛，由网关统一映射 502/504
     )
@@ -71,18 +93,35 @@ def build_chat_model(**overrides: Any) -> ChatOpenAI:
 
 
 async def probe(http: httpx.AsyncClient) -> dict[str, Any]:
-    """探测 vLLM 是否存活（GET /v1/models），给 /api/health 用。"""
+    """探测 vLLM 是否存活（GET /v1/models），给 /api/health 用。
+
+    顺带把 **实际生效的窗口大小**带回来：网关靠它算历史字符预算。
+    不能只看 VLLM_MAX_MODEL_LEN 环境变量——改了 .env 但没重启 vLLM 时两者会不一致，
+    按环境变量推导出的预算会把请求发成超长，照样被 vLLM 400 拒掉（实测踩过）。
+    """
     started = time.perf_counter()
     try:
         resp = await http.get(vllm_base_url() + "/v1/models", timeout=3.0)
         elapsed = round((time.perf_counter() - started) * 1000, 2)
         resp.raise_for_status()
-        ids = [m.get("id") for m in resp.json().get("data", [])]
-        return {"ok": True, "models": ids, "elapsed_ms": elapsed, "error": None}
+        data = resp.json().get("data", [])
+        ids = [m.get("id") for m in data]
+        window = None
+        for m in data:
+            try:
+                window = int(m.get("max_model_len"))
+                break
+            except (TypeError, ValueError):
+                continue
+        return {
+            "ok": True, "models": ids, "max_model_len": window,
+            "elapsed_ms": elapsed, "error": None,
+        }
     except Exception as exc:  # noqa: BLE001 - 探活不能抛，必须给聚合响应
         return {
             "ok": False,
             "models": [],
+            "max_model_len": None,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
             "error": f"{type(exc).__name__}: {exc}",
         }

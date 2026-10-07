@@ -184,6 +184,10 @@ def args_schema(spec: ToolSpec) -> type[BaseModel]:
     （如 detect 的 classes）无法推断类型，按可选 Any 处理。
     无参数的工具也要给显式空对象 schema——若留空，LangChain 会从 **kwargs
     签名推断出一个 "kwargs" 属性喂给 LLM，把它带偏。
+
+    **名字以 `_` 开头的参数是内部参数，不暴露给 LLM**。这类参数的值由网关注入
+    （如 read_document 的文件内容），模型既拿不到也不该编。实测 4B 会照着自己
+    臆造的值去调、拿到报错后**照着报错回答**，把已经放进上下文的正文全无视掉。
     """
     model = create_model(f"{spec.name}_args", **{
         name: (
@@ -191,6 +195,7 @@ def args_schema(spec: ToolSpec) -> type[BaseModel]:
             Field(default=default, description=f"默认 {default!r}"),
         )
         for name, default in spec.params.items()
+        if not name.startswith("_")
     })
     return model
 
@@ -247,9 +252,16 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
 
     写死工具名会在节点上下线后失真：比如 detect 下线后模型仍被要求
     "看物体用 detect"，调不到就编造检测结果。动态列出真实工具，并明确
-    禁止编造，模型缺工具时才会如实说"该功能暂未接入"。规则 4 给出
-    "何时自主调工具"的决策策略：预取只保底分析类观察，读字（ocr）、
-    风格生成（stylize）该不该做由模型看图 + 看问题自行判断。
+    禁止编造，模型缺工具时才会如实说"该功能暂未接入"。
+
+    几条规则是照着**实测的失败**加的，不是凭空写的：
+    - 「不要编造自己的知识截止日期」：问它"你的知识库到什么时候"，它答
+      "我的知识库更新至 2024年12月"——那个日期纯属编的，而且它压根没去检索。
+      原提示词里"你的训练数据有截止时间"这句反而在诱导它编一个。
+    - 「不要说无法调用工具」：追问"有具体的论文信息吗"，它答"也无法调用工具
+      来获取"，明明 kb_search 就在列表里却没调。
+    - 「【附带文件：…】是什么」：不交代来历，模型不认这段，还要再调一次
+      read_document（或者干脆无视掉）。
     """
     lines = []
     for t in tools:
@@ -257,28 +269,31 @@ def _system_prompt(tools: list[StructuredTool]) -> str:
         lines.append(f"- {t.name}: {first}。")
     tool_list = "\n".join(lines) if lines else "（当前没有可用工具）"
     return (
-        "你是多模态视觉助手，用户可能附带图片，需要你借助视觉工具回答。\n"
+        "你是多模态视觉助手，用户可能附带图片或文件。\n"
         f"当前可用的工具：\n{tool_list}\n\n"
         "规则：\n"
-        "1. 图片已经提供给工具，调用工具时不需要、也无法传图片本身；\n"
-        "2. 只能调用上面列出的工具，禁止调用列表外的工具，更禁止编造结果；\n"
-        "3. 用户消息里以「[xx 观察]」开头的段落，是系统已经替你调用工具得到的"
-        "**权威结果**，直接依据它回答，不要怀疑、不要编造观察里没有的信息；\n"
-        "4. 自主决定要不要再调工具：观察已覆盖问题就直接回答，不必重复调用；"
-        "问题需要读出图中文字（写了什么、牌子、号码等）而观察里没有文字内容，"
-        "调用 ocr；用户要求把图片转成某种风格（如动漫、素描），调用 stylize；"
-        "工具列表里有 kb_search 时，凡是知识类、事实类问题（某概念是什么、"
-        "有哪些、最新、怎么用、对比等），**必须先调 kb_search 检索再回答**——"
-        "你的训练数据有截止时间，知识库内容可能更新，检索结果与你的记忆冲突时"
-        "以检索为准；\n"
-        "5. 用户的问题可能带有错误预设（例如问“有几个人”但观察显示没有人）："
+        "1. **需要事实就去检索，别凭印象答**（列表里有 kb_search 时）：知识类问题"
+        "（某概念是什么、有哪些、怎么用、对比）、核实真假（是不是、真的吗）、"
+        "时间敏感（最新、最近、现在）、**以及任何问你自己**的问题（你能做什么、"
+        "你知不知道某某、你的知识到什么时候）。"
+        "**绝不要说「我的知识更新到某年某月」这类话**——那个日期只会是编的；"
+        "查不到就如实说知识库里没有；\n"
+        "2. 不要说「我无法调用工具」「我无法获取信息」。需要什么就去调工具；只准"
+        "调用上面列出的工具，**更禁止编造工具结果**；列表里确实没有合适工具时，"
+        "才如实说该功能暂未接入；\n"
+        "3. 图片和文件已经提供给工具，调用工具时不需要、也无法传图片或文件本身；\n"
+        "4. 用户消息里以「[xx 观察]」或「【附带文件：…】」开头的段落，是系统已经"
+        "替你调用工具、或已经替你读好的**权威内容**：直接依据它回答，不要怀疑，"
+        "也不要为了同一份东西再去调一次工具；\n"
+        "5. 视觉工具自己判断：观察里没有文字、而问题需要读图中文字（写了什么、"
+        "牌子、号码），调 ocr；用户要求把图片转成某种风格（动漫、素描），调 stylize；"
+        "观察已经覆盖了问题就直接回答，不必重复调用；\n"
+        "6. 用户的问题可能带有错误预设（例如问“有几个人”但观察显示没有人）："
         "一切以观察为准，观察里说没有就明确说没有；\n"
-        "6. 图片类工具（如风格迁移）的生成结果已直接展示给用户，你只需一句话"
+        "7. 图片类工具（如风格迁移）的生成结果已直接展示给用户，你只需一句话"
         "说明生成了什么，不要试图描述图片文件内容；\n"
-        "7. 消息里没有对应观察、且列表中没有合适工具时，如实告诉用户该功能"
-        "暂未接入，不要假装完成了检测或识别；\n"
         "8. 工具返回里的坐标是像素值，置信度范围 0~1；\n"
-        "9. 用中文简洁回答；工具失败时如实告诉用户原因。"
+        "9. 用中文简洁回答；工具失败时如实告诉用户原因；寒暄闲聊不必调工具。"
     )
 
 
@@ -395,22 +410,55 @@ async def run_chat(
     return reply, tool_calls, new_msgs
 
 
-def trim_history(messages: list[BaseMessage], max_messages: int) -> list[BaseMessage]:
-    """按条数裁剪历史，但绝不把一次工具调用对拦腰切断。
+def _msg_chars(msg: BaseMessage) -> int:
+    """一条消息的字符数。多模态 parts 只数文本部分（图片的 token 另算）。"""
+    content = msg.content
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(
+            len(str(p.get("text") or "")) for p in content if isinstance(p, dict)
+        )
+    return 0
 
-    超限时从尾部保留 max_messages 条；若切割点落在「发起了调用的 AI 消息」
-    或「工具观察消息」上，就向前回退到最近的干净边界（用户消息或普通
-    AI 回答之后），否则模型会看到一段没有来由的观察文本。
+
+def trim_history(
+    messages: list[BaseMessage],
+    max_messages: int,
+    max_chars: int | None = None,
+) -> list[BaseMessage]:
+    """按条数和字符预算裁剪历史，但绝不把一次工具调用对拦腰切断。
+
+    **两个上限缺一不可**：条数管不住上下文——一条带附件正文的用户消息可能几千字，
+    十几条就能把窗口撑爆，vLLM 直接回 400 把整轮对话打断，而且那条报错用户完全
+    无从下手。所以再按字符卡一道，超了同样从头部丢。
+
+    超限时从尾部保留；若切割点落在「发起了调用的 AI 消息」或「工具观察消息」上，
+    就向前回退到最近的干净边界（用户消息或普通 AI 回答之后），否则模型会看到
+    一段没有来由的观察文本。
     """
-    if len(messages) <= max_messages:
-        return list(messages)
-
     def is_dirty(msg: BaseMessage) -> bool:
         if msg.type == "tool":
             return True
         return bool(getattr(msg, "tool_calls", None))
 
-    start = len(messages) - max_messages
+    start = max(0, len(messages) - max_messages)
+
+    if max_chars:
+        # 从尾部往前累加，找出还能装进预算的最靠前起点
+        total = 0
+        i = len(messages)
+        while i > 0:
+            nxt = total + _msg_chars(messages[i - 1])
+            if nxt > max_chars:
+                break
+            total = nxt
+            i -= 1
+        # 单条就超预算时不能把最后一条也丢掉——那是用户刚说的话，
+        # 丢了模型只会答非所问。宁可超一点也要留着。
+        i = min(i, len(messages) - 1)
+        start = max(start, i)
+
     while start > 0 and is_dirty(messages[start]):
         start -= 1
     return list(messages[start:])
