@@ -1,119 +1,258 @@
-# mm-agent · 多模态系统
+# mm-agent · 多模态视觉智能体
 
-三个节点组成的多模态 AI 服务。分工、接口契约与协作规则见
-[docs/分工与接口约定.md](docs/分工与接口约定.md)——**接口以该文档 +
-`common/schemas.py` 为唯一契约**。
+把「目标检测 / 图像分类 / OCR / 风格迁移」四个视觉能力包成统一的 HTTP 服务，
+再由一个大模型 Agent 根据用户的自然语言提问**自主决定调哪个工具**。
 
-| 节点 | 机器 | 目录 | 端口 | 职责 |
-|------|------|------|------|------|
-| 网关 | 16GB（A） | `llm_node/` | 8000 | FastAPI 网关 + LangChain Agent + vLLM(Qwen2-VL) |
-| vision-fast | 8GB #1（B） | `vision_fast/` | 8101 | `detect` / `classify`，模型常驻 |
-| vision-heavy | 8GB #2（C） | `vision_heavy/` | 8102 | `ocr` / `stylize`，懒加载 |
+前端只需要对着一个网关发请求：上传图片 + 提问题，网关负责调工具、把结果喂给
+模型、把回答流式吐回来。**前端不必知道背后有几个节点、工具怎么调。**
 
-前端/用户只访问网关 `8000`；视觉节点只被网关调用。
+```
+                        你的前端（任意语言 / 框架）
+                                 │  HTTP + CORS
+                                 ▼
+        ┌──────────────────────────────────────────────┐
+        │  网关  llm_node/           :8000              │
+        │  /api/health  /api/tools  /api/chat(SSE)      │
+        │  大模型 Agent（vLLM，OpenAI 兼容）      :8001  │
+        └───────┬──────────────────────────┬───────────┘
+                │ 工具调用                  │ 工具调用
+                ▼                          ▼
+      ┌────────────────────┐    ┌────────────────────┐
+      │ vision_fast  :8101 │    │ vision_heavy :8102 │
+      │ detect / classify  │    │ ocr / stylize      │
+      │ 模型常驻显存        │    │ 懒加载 + 空闲释放    │
+      └────────────────────┘    └────────────────────┘
+```
+
+| 节点 | 目录 | 端口 | 职责 | 权重策略 |
+|---|---|---|---|---|
+| 网关 | `llm_node/` | 8000 | FastAPI 网关 + LangChain Agent + vLLM | — |
+| vision-fast | `vision_fast/` | 8101 | `detect`（YOLO）/ `classify`（ResNet50） | 常驻显存 |
+| vision-heavy | `vision_heavy/` | 8102 | `ocr`（PaddleOCR-VL）/ `stylize`（Gatys+VGG19） | 懒加载，空闲释放 |
+
+**加新工具不用改网关**：在所属节点用 `@tool` 声明四个字段、重启该节点、
+`POST /api/tools/refresh` 即可，Agent 会自动多出一个能调的工具。
 
 ## 快速开始
 
+### 一键脚本（推荐）
+
 ```bash
-pip install -r requirements.txt        # 或 uv pip install -r requirements.txt
+git clone <本仓库> && cd mm-agent
+uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
 
-# 两台 8GB（B / C）
+./scripts/mm-agent.sh start --mock      # 先跑 mock：不需要任何模型权重，秒起
+```
+
+`--mock` 模式下所有工具返回结构合法的占位结果，**前端开发时用这个最省事**——
+不用等权重下载、不占显存。
+
+跑真实模型：
+
+```bash
+# 网关 + 两个视觉节点 + vLLM
+./scripts/mm-agent.sh start --with-vllm --model weights/Qwen3-VL-4B-Instruct-AWQ-4bit
+
+./scripts/mm-agent.sh status              # 看谁在跑
+./scripts/mm-agent.sh stop
+```
+
+`--model` 指向 `weights/` 下的权重目录即可，**服务名和 chat template 会自动推导**：
+
+- 服务名 = 目录名小写，并且**同一个名字也喂给网关**，所以两边不可能对不上
+- chat template 优先用**该模型目录自带的** `chat_template.jinja`（Qwen3-VL 必须用
+  自带的；仓库里那份是 Qwen2.5 专用，混用会让模型看不到工具定义）
+
+不传 `--model` 时用 `VLLM_MODEL_PATH`，再没有就退回 Qwen2.5 的默认路径。
+
+> vLLM 在**另一个 venv**里（它和仓库 `.venv` 依赖冲突，装不到一起）。
+> 脚本默认找 `~/vllm-venv`，用 `VLLM_VENV=/path/to/venv` 覆盖。详见
+> [llm_node/README.md](llm_node/README.md#vllm网关机器专用)。
+
+### 手动起
+
+```bash
+# 8GB #1（B）
 uvicorn vision_fast.server:app   --host 0.0.0.0 --port 8101
+# 8GB #2（C）
 uvicorn vision_heavy.server:app  --host 0.0.0.0 --port 8102
-
 # 16GB（A）网关
 uvicorn llm_node.gateway:app     --host 0.0.0.0 --port 8000
 ```
 
-跨机联调时注入 IP（不要写死在代码里）：
+跨机联调时用环境变量注入各节点 IP（**不要写死在代码里**）：
 
 ```bash
 VISION_FAST_HOST=192.168.1.101 VISION_HEAVY_HOST=192.168.1.102 \
   uvicorn llm_node.gateway:app --host 0.0.0.0 --port 8000
 ```
 
-联调顺序（文档 §6.3）：各自起节点 → `GET /api/health` 全绿 →
-`GET /api/tools` 聚合到工具 → `POST /api/invoke` 打通 → 接真实模型 →
-最后 `POST /api/chat`。
+## 前端怎么接
+
+前端由各人自己写，**不需要写后端代理**。网关已开 CORS，浏览器可以直接连。
+
+### 接口一览
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/health` | 聚合健康状态。**联调先看它**，一眼看出哪个节点没起 |
+| GET | `/api/tools` | 工具清单（名字 / 说明 / 参数 / 是否需要图片） |
+| POST | `/api/tools/refresh` | 重新发现工具（节点加了新工具后调） |
+| POST | `/api/invoke` | 直接调**某一个**工具，不经大模型 |
+| POST | `/api/chat` | **对话主入口**，可带图，支持 SSE 流式 |
+
+### 推荐连法：浏览器直连网关
+
+```js
+const GATEWAY = 'http://192.168.1.100:8000';   // 网关所在机器，浏览器要能访问到
+```
+
+⚠️ **别写死 `127.0.0.1:8000`**。浏览器里的 `127.0.0.1` 指的是**用户自己的机器**，
+不是服务器。前端和网关不在同一台机器时，这会让请求打到用户自己的电脑上。
+建议按当前访问的主机名推导，或用配置项：
+
+```js
+const GATEWAY = `${location.protocol}//${location.hostname}:8000`;
+```
+
+CORS 默认全放开（`CORS_ALLOW_ORIGINS`）；要收紧就把它设成具体来源，逗号分隔：
+
+```bash
+CORS_ALLOW_ORIGINS=http://192.168.1.50:8080,http://localhost:3000 \
+  uvicorn llm_node.gateway:app --port 8000
+```
+
+### 对话：`POST /api/chat`
+
+请求：
+
+```json
+{
+  "session_id": "abc",              // 前端生成并保持，同 id 多轮续聊
+  "message": "图里有什么？",
+  "image": "data:image/png;base64,...",   // 可选，base64，可带 data: 前缀
+  "stream": true                    // 可选，true 走 SSE；不传则一次性返回 JSON
+}
+```
+
+`stream: false`（默认）时返回：
+
+```json
+{ "reply": "图中有 2 个目标……", "tool_calls": [{"tool": "detect", "ok": true, "result": {}}] }
+```
+
+`stream: true` 时响应是 **SSE**（`text/event-stream`），逐帧推送：
+
+| type | 载荷 | 说明 |
+|---|---|---|
+| `delta` | `text` | 回答的文本增量，一次一个 token |
+| `tool` | `tool` / `ok` / `result` / `error` | 工具调用记录，**跑完即推**，不用等整轮 |
+| `done` | `reply` / `tool_calls` | 本轮结束，`reply` 是完整回答 |
+| `error` | `message` | 生成中出错 |
+
+还会收到 `: keepalive` 之类的**注释帧**——那是保活用的，解析时忽略即可
+（反代容易掐掉长时间静默的连接）。
+
+命令行看一眼：
+
+```bash
+curl -N -X POST http://192.168.1.100:8000/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"demo","message":"你好","stream":true}'
+```
+
+浏览器里读（**不能用 `EventSource`**，它只支持 GET；用 `fetch` + 流）：
+
+```js
+const res = await fetch(GATEWAY + '/api/chat', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ session_id: sid, message, image, stream: true }),
+});
+
+const reader = res.body.getReader();
+const dec = new TextDecoder();
+let buf = '';
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buf += dec.decode(value, { stream: true });
+  let cut;
+  while ((cut = buf.indexOf('\n\n')) >= 0) {      // SSE 以空行分帧
+    const frame = buf.slice(0, cut); buf = buf.slice(cut + 2);
+    const line = frame.split('\n').find((l) => l.startsWith('data:'));
+    if (!line) continue;                          // 注释帧，跳过
+    const ev = JSON.parse(line.slice(5));
+    if (ev.type === 'delta')      append(ev.text);
+    else if (ev.type === 'tool')  showToolCard(ev);
+    else if (ev.type === 'done')  finish(ev.reply);
+    else if (ev.type === 'error') fail(ev.message);
+  }
+}
+```
+
+### 两个行为约定
+
+1. **图片只在「上传的那一轮」参与分析。** 传图那轮网关会先并行调
+   `detect`/`classify`/`ocr`，把结果喂给模型；之后的追问轮（如"谢谢你"）
+   **不会重跑工具**，靠会话历史回答。所以前端一轮里只需要在用户真正选了图时
+   带上 `image`。
+2. **图片别传太大。** 服务端会把喂给模型的那份缩到长边 1024，但 base64 走网络
+   仍占带宽。前端压缩到长边 ~1024 再传最省事。
+
+### 只想调单个工具？
+
+不想走大模型，就直接打 `/api/invoke`：
+
+```bash
+curl -X POST http://192.168.1.100:8000/api/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"tool":"detect","image":"<base64>","params":{"conf":0.3}}'
+```
+
+响应固定形状（**工具内部报错也是 HTTP 200**，靠 `ok:false` 表达）：
+
+```json
+{ "ok": true, "tool": "detect", "result": {"boxes": [], "count": 0}, "error": null, "elapsed_ms": 12.3 }
+```
+
+只有**未知工具**才返回 404；下游节点挂了 502、超时 504。
 
 ## 环境变量
 
+常用几个（完整表见 [llm_node/README.md](llm_node/README.md#环境变量)）：
+
 | 变量 | 默认 | 说明 |
-|------|------|------|
-| `VISION_FAST_HOST` / `VISION_HEAVY_HOST` | `127.0.0.1` | 两个视觉节点的 IP |
-| `LLM_HOST` | `127.0.0.1` | vLLM 所在机器 IP |
-| `GATEWAY_PORT` / `VLLM_PORT` / `VISION_FAST_PORT` / `VISION_HEAVY_PORT` | 8000 / 8001 / 8101 / 8102 | 端口 |
-| `TOOL_TIMEOUT` / `CHAT_TIMEOUT` | 30 / 60 秒 | 单次工具调用 / 对话超时 |
-| `NODE_MOCK` | 关 | `1` 时该节点返回合法占位结果（先 mock 后模型，文档 §6.2） |
-| `VLLM_MODEL_PATH` | `weights/Qwen2.5-VL-3B-Instruct-AWQ` | vLLM 加载的权重路径 |
-| `VLLM_MODEL_NAME` | `qwen2.5-vl-3b-awq` | 对外模型名（OpenAI 接口的 model 字段） |
-| `VLLM_MAX_MODEL_LEN` / `VLLM_GPU_MEMORY_UTILIZATION` | 4096 / 0.9 | vLLM 显存参数 |
-| `VLLM_WSL2_ENABLE_PIN_MEMORY` | 关 | WSL2 上 vLLM 默认禁用锁页内存，本机实测可用，WSL 跑 vLLM 时置 `1` |
+|---|---|---|
+| `VISION_FAST_HOST` / `VISION_HEAVY_HOST` | `127.0.0.1` | 两个视觉节点 IP |
+| `LLM_HOST` | `127.0.0.1` | vLLM 所在机器 |
+| `NODE_MOCK` | 关 | `1` = 返回占位结果，不加载模型 |
+| `CORS_ALLOW_ORIGINS` | `*` | 允许跨域的前端来源 |
+| `LLM_IMAGE_MAX_SIDE` | `1024` | 喂给模型的图片长边上限 |
+| `VLLM_MODEL_NAME` | `qwen2.5-vl-3b-awq` | **要和 vLLM 的 `--served-model-name` 一致** |
 
-## vLLM（网关机器专用）
+## 常见问题
 
-vLLM 只能跑 Linux：16GB 目标机原生跑；Windows 开发机走 WSL2。
-安装（WSL 侧，Python 3.12）：
+- **报 `No module named 'httpx'` / `'langchain'` / `'vllm'`** —— 用错 venv 了。
+  网关和视觉节点用仓库 `.venv`；vLLM 用它自己的 venv。
+- **前端报 `Load failed`（Safari）/ `Failed to fetch`（Chrome）** —— 多半不是网络
+  问题，而是网关侧抛了异常把 SSE 连接掐断了。**先看网关日志**（`./scripts/mm-agent.sh`
+  起的在 `.run/logs/gateway.log`）。
+- **对话报「LLM 服务不可达」** —— vLLM 没起。只想看界面就加 `--mock`。
+- **报 `Input length ... exceeds model's maximum context length`** —— 图片太大。
+  服务端已做缩图，若仍出现说明调大了 `LLM_IMAGE_MAX_SIDE` 或把
+  `--max-model-len` 设小了。
 
-```bash
-uv venv ~/vllm-venv --python 3.12
-uv pip install --python ~/vllm-venv/bin/python vllm==0.26.0   # 不要升 0.27+，见 requirements.txt 注释
-```
+## 相关文档
 
-系统需 CUDA toolkit ≥ 12.9（flashinfer 现场编译 kernel 需要 nvcc；
-CUDA 13.1 实测通过，只装 `cuda-toolkit-13-1`，别装会换驱动的 `cuda` 元包；
-Ubuntu 26.04 的 multiverse 仓库直接有，WSL 里 `apt install cuda-toolkit-13-1` 即可）。
+- [docs/分工与接口约定.md](docs/分工与接口约定.md) —— **接口契约唯一依据**，改动需三人同意
+- [llm_node/README.md](llm_node/README.md) —— 网关与 vLLM 细节、环境变量全表
+- [vision_fast/README.md](vision_fast/README.md) / [vision_heavy/README.md](vision_heavy/README.md) —— 两个视觉节点
+- `scripts/mm-agent.sh --help` —— 一键脚本
 
-权重放 `weights/`（已 gitignore），从 ModelScope 下载（**要能自发调用工具，
-最小只能用 3B**：2B 及以下的量化版不会输出 tool_call）：
-
-```bash
-modelscope download --model Qwen/Qwen2.5-VL-3B-Instruct-AWQ \
-  --local_dir weights/Qwen2.5-VL-3B-Instruct-AWQ
-```
-
-启动命令直接打印（在 WSL/Linux 侧执行）：
+## 后端契约自检
 
 ```bash
-python -m llm_node.llm
-# VLLM_WSL2_ENABLE_PIN_MEMORY=1 vllm serve weights/Qwen2.5-VL-3B-Instruct-AWQ \
-#   --served-model-name qwen2.5-vl-3b-awq \
-#   --chat-template llm_node/qwen25_tools_chat_template.jinja \
-#   --port 8001 --max-model-len 4096 --gpu-memory-utilization 0.9 \
-#   --enable-auto-tool-choice --tool-call-parser hermes
+python -m common.selftest     # 不依赖模型权重
+pytest tests/ -p anyio        # 网关侧测试
 ```
-
-`--chat-template` 不能省：VL 权重自带的模板不支持 tools，模型看不到工具
-定义、永远不会自发调用（`qwen25_tools_chat_template.jinja` 来自 Qwen2.5
-官方模板，支持 `<tool_call>` 格式）。
-
-**16GB 机切 7B 只改路径，代码零改动**：
-`VLLM_MODEL_PATH=weights/Qwen2-VL-7B-AWQ python -m llm_node.llm`。
-8GB 显存紧张时降 `VLLM_GPU_MEMORY_UTILIZATION=0.8` 或 `VLLM_MAX_MODEL_LEN=2048`。
-
-## 加新工具（零改网关，文档 §5）
-
-1. 在所属节点用 `common.registry.tool` 装饰器实现（四字段：name/description/needs_image/params）；
-2. 重启该节点；
-3. `POST /api/tools/refresh`。
-
-`GET /api/tools` 出现它，Agent 自动多出一个能调用的工具。
-
-## 测试（网关侧）
-
-```bash
-pytest tests/
-```
-
-测试不占端口：下游用 `common.node.build_app` 起真实契约的 ASGI app，
-经进程内路由传输层连接；`NODE_MOCK=1` 的 mock 端到端可在无模型环境跑。
-
-## 已知问题
-
-- `common/config.py` 的 `base_url()`：对 `"llm"` 键会 KeyError、`"vllm"`/`"gateway"`
-  键会静默错路由到 vision-heavy。网关侧已绕开（自拼 URL），修复需三人同意。
-- WSL2 上 vLLM 默认禁用 pinned memory（`is_pin_memory_available()` 恒 False），
-  启动会报 `UVA is not available`；本机 torch 锁页分配实测正常，属于保守开关，
-  置 `VLLM_WSL2_ENABLE_PIN_MEMORY=1` 即可（见上方环境变量表）。
-- vLLM 0.26 的显存检查要求 空闲显存 ≥ `gpu-memory-utilization` × 总显存。
-  Windows 桌面约占 1.1GB，所以 WSL 里 8GB 卡的该参数最高约 0.85。

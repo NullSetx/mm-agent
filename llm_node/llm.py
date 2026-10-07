@@ -28,6 +28,15 @@ from langchain_openai import ChatOpenAI
 
 from common.config import CHAT_TIMEOUT, HOSTS, PORTS, ROOT, WEIGHTS_DIR
 
+# 本机服务（vLLM、视觉节点）绝不走系统代理：CN 开发机常开代理时，
+# openai/httpx 会把 127.0.0.1 的请求交给代理，代理连不上目标就代答 502，
+# 让"LLM 不可达"的判断完全失真。进程级 setdefault，一次设置全局生效。
+_no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+for _host in ("localhost", "127.0.0.1"):
+    if _host not in _no_proxy:
+        _no_proxy = f"{_no_proxy},{_host}" if _no_proxy else _host
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = _no_proxy
+
 
 def vllm_base_url() -> str:
     """vLLM 的 OpenAI 兼容基址。
