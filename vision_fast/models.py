@@ -147,7 +147,7 @@ def resolve_yolo_weights() -> str:
     env = os.getenv("YOLO_WEIGHTS", "").strip()
     if env:
         return env
-    local = WEIGHTS_DIR / "yolov8s.pt"
+    local = WEIGHTS_DIR / "yolo26s.pt"
     if local.exists():
         return str(local)
     return "yolov8s.pt"

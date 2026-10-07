@@ -20,8 +20,9 @@
       ┌────────────────────┐ ┌────────────────────┐ ┌──────────────────┐
       │ vision_fast  :8101 │ │ vision_heavy :8102 │ │ kb_node    :8103 │
       │ detect / classify  │ │ ocr / stylize      │ │ kb_search        │
-      │ 模型常驻显存        │ │ 懒加载 + 空闲释放    │ │ 检索百科+项目文档 │
-      └────────────────────┘ └────────────────────┘ │ 纯 CPU           │
+      │ 模型常驻显存        │ │ read_document      │ │ 检索百科+项目文档 │
+      │                    │ │ 懒加载 + 空闲释放    │ │ 纯 CPU           │
+      └────────────────────┘ └────────────────────┘ │                  │
                                                     └──────────────────┘
 ```
 
@@ -29,7 +30,7 @@
 |---|---|---|---|---|
 | 网关 | `llm_node/` | 8000 | FastAPI 网关 + LangChain Agent + vLLM | — |
 | vision-fast | `vision_fast/` | 8101 | `detect`（YOLO）/ `classify`（ResNet50） | 常驻显存 |
-| vision-heavy | `vision_heavy/` | 8102 | `ocr`（PaddleOCR-VL）/ `stylize`（Gatys+VGG19） | 懒加载，空闲释放 |
+| vision-heavy | `vision_heavy/` | 8102 | `ocr`（PaddleOCR-VL）/ `stylize`（Gatys+VGG19）/ `read_document`（PDF · 文本代码） | 懒加载，空闲释放 |
 | kb_node | `kb_node/` | 8103 | `kb_search`（检索 `wiki/` 百科词条 + `docs/` 项目文档，带来源） | 纯 CPU；详见 [kb_node/README.md](kb_node/README.md) |
 
 **加新工具不用改网关**：在所属节点用 `@tool` 声明四个字段、重启该节点、
