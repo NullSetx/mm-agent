@@ -94,6 +94,40 @@ async def test_chat_real_loop_end_to_end(gateway, router, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_followup_round_gets_image_hint(gateway, router, monkeypatch):
+    """追问轮（本轮没传新图、会话有图）：模型收到"会话图仍可用"的提示。
+
+    回归背景：模型把"本轮没传图"误读成"没图可用"，让用户重传会话里
+    明明已有的图片。
+    """
+    captured: dict = {}
+
+    class RecordingModel(FakeAgentModel):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            captured["messages"] = messages
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    router[FAST] = make_toy_node("vision-fast", [
+        {"name": "ocr", "description": "读字", "needs_image": True,
+         "params": {}, "fn": lambda image: {"full_text": ""}},
+    ])
+    await gateway.post("/api/tools/refresh")
+    monkeypatch.setattr(
+        llm, "build_chat_model",
+        lambda **kw: RecordingModel(responses=[AIMessage(content="好")]),
+    )
+
+    img = _tiny_png_base64()
+    await gateway.post("/api/chat",
+                       json={"session_id": "s7", "message": "看看", "image": img})
+    await gateway.post("/api/chat", json={"session_id": "s7", "message": "提取文字"})
+
+    human = [m for m in captured["messages"]
+             if getattr(m, "type", "") == "human"][-1]
+    assert "会话中已有一张此前上传的图片" in str(human.content)
+
+
+@pytest.mark.anyio
 async def test_chat_trims_history(gateway, router, monkeypatch):
     """历史超过上限时只保留最近 MAX_HISTORY_MESSAGES 条。"""
     router[FAST] = make_toy_node("vision-fast", [

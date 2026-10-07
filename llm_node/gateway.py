@@ -49,7 +49,7 @@ _HEALTH_TIMEOUT = 3.0
 _CONNECT_TIMEOUT = 5.0
 
 #: 会话历史保留的最大消息数（含工具消息）
-MAX_HISTORY_MESSAGES = 12
+MAX_HISTORY_MESSAGES = 108
 
 #: 需要 CORS。默认放开（内网演示）；公网部署时应改成具体来源，逗号分隔
 CORS_ALLOW_ORIGINS = [
@@ -62,6 +62,13 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+#: 追问轮（本轮没传新图、会话里有图）注入给模型的提示：不然小模型会误判
+#: "本轮没图 = 没图可用"，让用户重传一张明明已经在会话里的图
+_FOLLOWUP_IMAGE_HINT = (
+    "（会话中已有一张此前上传的图片；调用 ocr/stylize 等图片工具时会自动使用它，"
+    "无需用户重新上传）"
+)
 
 
 def node_url(node: str) -> str:
@@ -332,9 +339,13 @@ async def _stream_events(
     # 只在**这一轮上传了新图**时预取。会话图会跨轮留存，若按 session.image
     # 判断，用户之后随便说句"谢谢你"都会把 detect/classify 重跑一遍，
     # 而且观察被重新注入会把模型带偏成继续描述图片。
+    # 追问轮（本轮没传新图但会话有图）给模型一句提示：图片工具仍可用
+    # （工具自动取会话图），否则小模型会误以为"没图"而让用户重传。
     observations, prefetch = None, []
     if req.image and session.image:
         observations, prefetch = await _prefetch_observations(http, catalog, session.image)
+    elif session.image:
+        observations = _FOLLOWUP_IMAGE_HINT
     collected: list[dict[str, Any]] = list(prefetch)
     for r in prefetch:
         yield _sse({"type": "tool", **r})
@@ -554,12 +565,14 @@ def build_app() -> FastAPI:
             )
 
         # 只在**这一轮上传了新图**时预取（与流式路径同一判断，理由见 _stream_events）；
-        # stylize 等生成式工具仍由模型自主调用
+        # 追问轮给模型一句提示：会话图仍在，图片工具可直接用（见 _FOLLOWUP_IMAGE_HINT）
         observations, prefetch_records = None, []
         if req.image and session.image:
             observations, prefetch_records = await _prefetch_observations(
                 http, catalog, session.image
             )
+        elif session.image:
+            observations = _FOLLOWUP_IMAGE_HINT
 
         def invoke(tool: str, image: str | None, params: dict[str, Any]) -> Any:
             return invoke_tool(http, catalog, tool, image, params)
