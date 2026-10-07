@@ -64,6 +64,36 @@ async def test_tool_observation_reports_failure_not_raise():
     assert "GatewayError" in out
 
 
+@pytest.mark.anyio
+async def test_tool_without_image_blocked_before_invoke():
+    """无图时调用 needs_image 工具：不出网、返回可读提示、记录 ok=false。
+
+    回归背景：4B 模型在闲聊轮凭空调用 stylize，道歉后还会再犯。
+    """
+    calls: list = []
+
+    async def invoke(tool, image, params):
+        calls.append((tool, image))
+        return InvokeResponse(ok=True, tool=tool, result={})
+
+    tool = agent.build_tool(
+        ToolSpec(name="stylize", description="风格迁移", needs_image=True), invoke
+    )
+    records: list = []
+    token = agent._current_records.set(records)
+    try:
+        out = await tool.ainvoke({})
+    finally:
+        agent._current_records.reset(token)
+
+    assert calls == []                          # 拦截在网关之前，没出网
+    assert "没有可用图片" in out
+    assert records == [{
+        "tool": "stylize", "ok": False, "result": None,
+        "error": agent._NO_IMAGE_HINT,
+    }]
+
+
 # ---------------------------------------------------------------- 结果加工层
 
 def test_render_detect_lists_objects():

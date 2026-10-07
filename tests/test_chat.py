@@ -106,7 +106,9 @@ async def test_chat_trims_history(gateway, router, monkeypatch):
         lambda **kw: FakeAgentModel(responses=[AIMessage(content="好")]),
     )
 
-    for i in range(15):  # 每轮历史 +1 条，15 轮必然触发裁剪
+    # 每轮历史 +2 条，轮数按当前窗口值算，必然触发裁剪（窗口被调大也成立）
+    rounds = gw.MAX_HISTORY_MESSAGES // 2 + 2
+    for i in range(rounds):
         resp = await gateway.post(
             "/api/chat", json={"session_id": "s3", "message": f"第{i}轮"}
         )
